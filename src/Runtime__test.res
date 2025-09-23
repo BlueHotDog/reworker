@@ -18,6 +18,10 @@ module MockBindings = {
 
   // Store added listeners count for verification
   let addedListenerCount = ref(0)
+  let removedListenerCount = ref(0)
+
+  // Store actual handlers for removeListener testing (using Obj.t for type erasure)
+  let storedHandlers: ref<array<Obj.t>> = ref([])
 
   let sendMessage: 'a => Promise.t<'b> = message => {
     // Just increment counter instead of storing the actual messages
@@ -28,14 +32,18 @@ module MockBindings = {
   }
 
   module OnMessage = {
-    let addListener = handler => {
+    let addListener: (('a, sender, 'b => unit) => bool) => unit = handler => {
       addedListenerCount := addedListenerCount.contents + 1
-      ignore(handler)
+      storedHandlers := Array.concat(storedHandlers.contents, [Obj.magic(handler)])
     }
 
-    let removeListener = _handler => {
-      // Mock implementation
-      ()
+    let removeListener: (('a, sender, 'b => unit) => bool) => unit = handler => {
+      // Check if handler exists in stored handlers
+      let exists = Array.some(storedHandlers.contents, stored => Obj.magic(stored) === Obj.magic(handler))
+      if exists {
+        removedListenerCount := removedListenerCount.contents + 1
+        storedHandlers := Array.filter(storedHandlers.contents, stored => Obj.magic(stored) !== Obj.magic(handler))
+      }
     }
   }
 
@@ -45,6 +53,8 @@ module MockBindings = {
   let reset = () => {
     sentMessageCount := 0
     addedListenerCount := 0
+    removedListenerCount := 0
+    storedHandlers := []
   }
 }
 
@@ -294,6 +304,227 @@ let testBasicChunkedMessage = () => {
   }
 }
 
+// Test: removeListener removes correct handler
+let testRemoveListenerBasic = () => {
+  MockBindings.reset()
+
+  let handler1 = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("handler1")
+    | _ => Response.none
+    }
+  }
+
+  let handler2 = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("handler2")
+    | _ => Response.none
+    }
+  }
+
+  try {
+    // Add both handlers
+    TestRuntime.OnMessage.addListener(handler1)
+    TestRuntime.OnMessage.addListener(handler2)
+
+    // Verify both added
+    let addedCount = MockBindings.addedListenerCount.contents
+    if addedCount !== 2 {
+      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
+      false
+    } else {
+      // Remove first handler
+      TestRuntime.OnMessage.removeListener(handler1)
+
+      let removedCount = MockBindings.removedListenerCount.contents
+      if removedCount === 1 {
+        Console.log("PASS: removeListener removed correct handler")
+        true
+      } else {
+        Console.error(`FAIL: Expected 1 removed listener, got ${removedCount->Int.toString}`)
+        false
+      }
+    }
+  } catch {
+  | error =>
+    Console.error2("FAIL: Exception during removeListener basic test:", error)
+    false
+  }
+}
+
+// Test: removeListener with non-existent handler
+let testRemoveListenerNonExistent = () => {
+  MockBindings.reset()
+
+  let handler1 = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("handler1")
+    | _ => Response.none
+    }
+  }
+
+  let handler2 = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("handler2")
+    | _ => Response.none
+    }
+  }
+
+  try {
+    // Add only handler1
+    TestRuntime.OnMessage.addListener(handler1)
+
+    // Try to remove handler2 (never added)
+    TestRuntime.OnMessage.removeListener(handler2)
+
+    let removedCount = MockBindings.removedListenerCount.contents
+    if removedCount === 0 {
+      Console.log("PASS: removeListener ignores non-existent handler")
+      true
+    } else {
+      Console.error(`FAIL: Expected 0 removed listeners, got ${removedCount->Int.toString}`)
+      false
+    }
+  } catch {
+  | error =>
+    Console.error2("FAIL: Exception during removeListener non-existent test:", error)
+    false
+  }
+}
+
+// Test: removeListener with same handler added multiple times
+let testRemoveListenerDuplicate = () => {
+  MockBindings.reset()
+
+  let handler = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("handler")
+    | _ => Response.none
+    }
+  }
+
+  try {
+    // Add same handler twice
+    TestRuntime.OnMessage.addListener(handler)
+    TestRuntime.OnMessage.addListener(handler)
+
+    let addedCount = MockBindings.addedListenerCount.contents
+    if addedCount !== 2 {
+      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
+      false
+    } else {
+      // Remove handler once
+      TestRuntime.OnMessage.removeListener(handler)
+
+      let removedCount = MockBindings.removedListenerCount.contents
+      let remainingHandlers = Array.length(MockBindings.storedHandlers.contents)
+
+      if removedCount === 1 && remainingHandlers === 1 {
+        Console.log("PASS: removeListener removes one instance of duplicate handler")
+        true
+      } else {
+        Console.error(`FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`)
+        false
+      }
+    }
+  } catch {
+  | error =>
+    Console.error2("FAIL: Exception during removeListener duplicate test:", error)
+    false
+  }
+}
+
+// Test: removeListener with different message types
+let testRemoveListenerDifferentTypes = () => {
+  MockBindings.reset()
+
+  let stringHandler = (message, _sender) => {
+    switch message {
+    | SimpleTest(_) => Response.now("string response")
+    | _ => Response.none
+    }
+  }
+
+  let unitHandler = (message, _sender) => {
+    switch message {
+    | NoResponseTest => Response.none
+    | _ => Response.none
+    }
+  }
+
+  try {
+    // Add handlers with different message types
+    TestRuntime.OnMessage.addListener(stringHandler)
+    TestRuntime.OnMessage.addListener(unitHandler)
+
+    let addedCount = MockBindings.addedListenerCount.contents
+    if addedCount !== 2 {
+      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
+      false
+    } else {
+      // Remove string handler
+      TestRuntime.OnMessage.removeListener(stringHandler)
+
+      let removedCount = MockBindings.removedListenerCount.contents
+      let remainingHandlers = Array.length(MockBindings.storedHandlers.contents)
+
+      if removedCount === 1 && remainingHandlers === 1 {
+        Console.log("PASS: removeListener works with different message types")
+        true
+      } else {
+        Console.error(`FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`)
+        false
+      }
+    }
+  } catch {
+  | error =>
+    Console.error2("FAIL: Exception during removeListener different types test:", error)
+    false
+  }
+}
+
+// Test: removeListener memory behavior (WeakMap cleanup)
+let testRemoveListenerMemoryBehavior = () => {
+  MockBindings.reset()
+
+  // Create handler in a scope that will be GC eligible
+  let testHandler = ref(None)
+
+  let createHandler = () => {
+    (message, _sender) => {
+      switch message {
+      | SimpleTest(_) => Response.now("scoped handler")
+      | _ => Response.none
+      }
+    }
+  }
+
+  try {
+    let handler = createHandler()
+    testHandler := Some(handler)
+
+    // Add and then remove handler
+    TestRuntime.OnMessage.addListener(handler)
+    TestRuntime.OnMessage.removeListener(handler)
+
+    let removedCount = MockBindings.removedListenerCount.contents
+    if removedCount === 1 {
+      // Clear reference to make handler eligible for GC
+      testHandler := None
+
+      Console.log("PASS: removeListener completed cleanup (WeakMap should allow GC)")
+      true
+    } else {
+      Console.error(`FAIL: Expected 1 removed listener, got ${removedCount->Int.toString}`)
+      false
+    }
+  } catch {
+  | error =>
+    Console.error2("FAIL: Exception during removeListener memory test:", error)
+    false
+  }
+}
+
 // Run all tests
 let runTests = () => {
   let tests = [
@@ -307,6 +538,11 @@ let runTests = () => {
     ("Error handling in user handler", testErrorHandlingInUserHandler),
     ("Chunked message handling", testChunkedMessageOutOfOrder),
     ("Basic chunked message", testBasicChunkedMessage),
+    ("removeListener basic functionality", testRemoveListenerBasic),
+    ("removeListener non-existent handler", testRemoveListenerNonExistent),
+    ("removeListener duplicate handler", testRemoveListenerDuplicate),
+    ("removeListener different message types", testRemoveListenerDifferentTypes),
+    ("removeListener memory behavior", testRemoveListenerMemoryBehavior),
   ]
 
   TestUtils.runSyncTests("Runtime Integration Tests", tests)

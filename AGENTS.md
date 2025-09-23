@@ -170,6 +170,11 @@ module type RuntimeBindings = {
 - Compilation errors with bleeding-edge ReScript features
 - Interface file (`.resi`) synchronization
 
+**Build System**:
+- Use `make build` for compilation (not `npm run build`)
+- Use `make test` for running tests
+- Use `make help` to see all available commands
+
 ## Usage Patterns
 
 ### Defining New Messages

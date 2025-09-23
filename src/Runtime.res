@@ -19,7 +19,10 @@ module type RuntimeBindings = {
 }
 
 module Make = (Bindings: RuntimeBindings) => {
-  module HandlerMap = RequestHandler__Map
+  module RequestHandlerMap = RequestHandler__Map
+
+  // Type-safe handler mapping for removeListener functionality
+  let handlerToWrapped: HandlerMap.t = HandlerMap.make()
 
   let sendMessage:
     type a. Types.message<a> => Promise.t<a> =
@@ -83,15 +86,22 @@ module Make = (Bindings: RuntimeBindings) => {
           }
         }
 
+        // Store mapping for later removal
+        HandlerMap.set(handlerToWrapped, userResponseHandler, messageHandler)
+
         Bindings.OnMessage.addListener(messageHandler)
       }
 
     let removeListener:
       type a. ((Types.message<a>, Bindings.sender) => Response.t<a>) => unit =
-      _handler => {
-        // Note: This is tricky because we need to track the wrapped handler
-        // For now, we'll warn that this isn't fully supported
-        Console.warn("removeListener not fully supported - manage listeners in your bindings")
+      userHandler => {
+        switch HandlerMap.get(handlerToWrapped, userHandler) {
+        | Some(wrappedHandler) => {
+            Bindings.OnMessage.removeListener(wrappedHandler)
+            HandlerMap.delete(handlerToWrapped, userHandler)
+          }
+        | None => Console.warn("Handler not found - was it already removed or never added?")
+        }
       }
   }
 
