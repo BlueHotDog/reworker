@@ -1,76 +1,5 @@
 # 🚀 Open Source Release TODO for @bluehotdog/reworker
 
-## 🔒 **CRITICAL LEGAL COMPLIANCE**
-
-### ⚠️ URGENT: Fix License Inconsistency
-- [X] **License Decision**: Choose MIT (recommended for libraries) or AGPL v3
-- [X] **Update LICENSE file**: Replace current AGPL v3 with chosen license
-- [X] **Update package.json**: Fix `"license"` field to match LICENSE file
-- [X] **Verify copyright ownership**: Ensure you own all code in package
-- [X] **Check for proprietary code**: No company/confidential code included
-
-### License Headers
-- [X] Add consistent license headers to all `.res` and `.resi` files
-- [X] Include copyright notice with year and owner name
-- [X] Use SPDX identifier format (e.g., `// SPDX-License-Identifier: MIT`)
-
-## 📦 **PACKAGE CONFIGURATION**
-
-### Update package.json for Public Release
-- [X] **Name**: Change from `@bluehotdog/reworker` to final public name
-- [X] **Description**: Add comprehensive description of the library
-- [X] **Author**: Add your name and contact info
-- [X] **Homepage**: Add GitHub pages or documentation URL
-- [X] **Repository**: Add GitHub repository URL
-- [X] **Bugs**: Add GitHub issues URL
-- [X] **Keywords**: Expand beyond just "rescript" - add:
-  - "chrome-extension"
-  - "message-passing"
-  - "webworker"
-  - "gadt"
-  - "type-safe"
-  - "chunking"
-  - "zero-dependencies"
-  - "framework-agnostic"
-- [X] **Exports**: N/A - ReScript-only library, no JS module exports needed
-- [X] **Files**: Add `files` field to control published content
-- [X] **Engines**: Specify Node.js version requirements (Node 18+)
-- [X] **PublishConfig**: Add public access configuration
-- [X] **DevDependencies**: Add empty devDependencies section
-
-### ReScript Configuration
-- [X] Verify `rescript.json` works standalone (outside monorepo)
-- [X] Check `sources` paths are correct for new structure
-- [X] Confirm `bsc-flags` appropriate for public library
-- [X] Verify ESM output settings (`"module": "esmodule"`) with custom .res.mjs suffix
-
-## 📁 **REPOSITORY STRUCTURE**
-
-### Essential Files
-- [x] ✅ README.md (excellent quality)
-- [x] ✅ CLAUDE.md (comprehensive documentation)
-- [x] **LICENSE** - Fix inconsistency with package.json
-- [x] **CHANGELOG.md** - Document version history and breaking changes
-- [x] **.gitignore** - ReScript/Node.js appropriate gitignore
-- [x] **.npmignore** - Control what gets published to npm
-
-### Documentation Improvements
-- [X] Add browser compatibility matrix to README
-- [X] Create troubleshooting section
-- [X] Add migration guide from internal usage
-- [X] Document performance characteristics
-- [X] Add API reference with all public functions
-
-## 🔧 **DEVELOPMENT INFRASTRUCTURE**
-
-### Makefile Enhancement
-- [x] ✅ Basic Makefile exists
-- [x] ✅ Add standard targets: `install`, `build`, `test`, `lint`, `clean`, `dev`
-- [x] ✅ Implement color output for better UX
-- [X] Add `bootstrap` target for tool installation (optional - npm install covers this)
-- [x] ✅ Add `publish` target for npm publishing
-- [x] ✅ Add `help` target with auto-generated help system
-
 ### Testing Requirements
 - [x] ✅ Test files exist (*__test.res files)
 - [ ] **Comprehensive test coverage**: Aim for 100% of public API
@@ -84,16 +13,6 @@
 - [ ] Add pre-commit hooks for quality gates
 
 ## 🔄 **CI/CD PIPELINE**
-
-### GitHub Actions Setup
-- [X] **Compilation check**: ReScript builds successfully with strict warnings
-- [X] **Test execution**: All tests pass via Makefile
-- [X] **Code formatting**: `rescript format -check` verification
-- [X] **Multi-platform**: Test on Ubuntu (Linux CI coverage)
-- [X] **Multiple ReScript versions**: Test compatibility range (beta.12, rc.1)
-- [X] **Dependency audit**: Security vulnerability scanning with npm audit
-- [X] **Quality gates**: Development artifact detection, package consistency checks
-- [X] **Multi-Node support**: Node 18.x, 20.x, 22.x compatibility testing
 
 ### Release Automation
 - [ ] **Semantic versioning**: Automated version bumping
@@ -177,11 +96,11 @@
 - [ ] **No development artifacts**: Remove TODO/FIXME/console.log
 
 ### Legal Final Review
-- [ ] **License consistency**: package.json matches LICENSE file
-- [ ] **File headers consistent**: All source files properly licensed
-- [ ] **No copyright conflicts**: Clean ownership chain
-- [ ] **No proprietary code**: Nothing confidential included
-- [ ] **Attribution complete**: All contributors credited
+- [X] **License consistency**: package.json matches LICENSE file (MIT)
+- [X] **File headers consistent**: All source files properly licensed
+- [X] **No copyright conflicts**: Clean ownership chain
+- [X] **No proprietary code**: Nothing confidential included
+- [X] **Attribution complete**: All contributors credited
 
 ### Quality Assurance
 - [ ] **Performance testing**: Chunking works under load
