@@ -1,0 +1,56 @@
+# Development files
+.git/
+.github/
+.vscode/
+.idea/
+
+# Build tools and configs
+Makefile
+.bsb.lock
+.merlin
+
+# Tests and development
+*__test.res
+TestRunner.res
+TestUtils.res
+TESTING.md
+
+# Documentation that's not needed in package
+CLAUDE.md
+TODO.md
+
+# Logs and runtime
+logs/
+*.log
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Dependencies
+node_modules/
+
+# Compiled JavaScript output (this is a ReScript library)
+lib/
+*.js
+*.mjs
+*.res.mjs
+
+# Coverage and testing
+coverage/
+.nyc_output
+
+# Environment
+.env
+.env.test
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

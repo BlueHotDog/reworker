@@ -1,0 +1,41 @@
+{
+	"name": "@bluehotdog/re-webworker",
+	"version": "0.0.1",
+	"description": "Type-safe, chunked message passing for Chrome extensions/WebWorkers/ServiceWorkers with zero runtime dependencies. Built with ReScript GADTs for compile-time safety.",
+	"keywords": [
+		"rescript",
+		"chrome-extension",
+		"webworker",
+		"wxt",
+		"serviceworker",
+		"message-passing",
+		"browser-extension",
+		"messaging"
+	],
+	"author": "BlueHotDog",
+	"license": "MIT",
+	"homepage": "https://github.com/BlueHotDog/re-webworker#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/BlueHotDog/re-webworker.git"
+	},
+	"bugs": {
+		"url": "https://github.com/BlueHotDog/re-webworker/issues"
+	},
+	"files": [
+		"src/**/*.res",
+		"src/**/*.resi",
+		"rescript.json",
+		"README.md",
+		"LICENSE",
+		"CHANGELOG.md"
+	],
+	"engines": {
+		"node": ">=16.0.0"
+	},
+	"sideEffects": false,
+	"dependencies": {},
+	"peerDependencies": {
+		"rescript": "^12.0.0-beta.12"
+	}
+}
