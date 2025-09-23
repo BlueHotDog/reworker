@@ -1,6 +1,6 @@
-# Re-WebWorker - Universal Message Passing Library
+# ReWorker - Universal Message Passing Library
 
-**@bluehotdog/re-webworker** is a ReScript library providing type-safe, chunked message passing for WebWorkers, ServiceWorkers, and browser extensions using GADTs (Generalized Algebraic Data Types).
+**@bluehotdog/reworker** is a ReScript library providing type-safe, chunked message passing for WebWorkers, ServiceWorkers, and browser extensions using GADTs (Generalized Algebraic Data Types).
 
 ## Core Features
 
@@ -109,6 +109,9 @@ User Level:                     Transport Level:                 Receiving Side:
 ### Runtime Bindings Agent
 **Use this agent for**: Creating browser bindings, integrating with different Chrome extension frameworks
 
+**Manifest V3 Promise-Based Design**:
+We're targeting Manifest V3 extensions, which means we can work purely with promises rather than legacy callback patterns. This simplifies the API significantly.
+
 **Native Chrome API Interface**:
 The Runtime uses a native Chrome API pattern for maximum compatibility:
 ```rescript
@@ -127,6 +130,7 @@ module type RuntimeBindings = {
 - Handlers receive `(message, sender, sendResponse)`
 - Return `bool` indicating if response will be sent asynchronously
 - No forced `Response.t` types - bindings stay native
+- **Manifest V3**: Promise-based APIs enable cleaner async patterns without callback complexity
 
 **Integration Examples**:
 - **Web Workers**: Use `postMessage`/`onmessage` APIs
@@ -134,6 +138,7 @@ module type RuntimeBindings = {
 - **WXT Framework**: Use `@packages/bindings-wxt/src/WxtRuntime.res`
 - **WebExtension-API**: Create similar bindings using `browser.runtime`
 - **Raw Chrome APIs**: Bind directly to `chrome.runtime` APIs
+- **Manifest V3**: All Chrome extension APIs now return promises, simplifying async handling
 
 **Communication Patterns**:
 - **Native bindings**: Use standard JavaScript message passing patterns
@@ -141,12 +146,14 @@ module type RuntimeBindings = {
 - **No adapters needed**: Pass native bindings directly to Runtime.Make
 - **Automatic chunking**: All chunking handled internally via TransportMessage system
 - **Type safety**: ReScript values pass through as stable JavaScript objects
+- **Promise-based**: Manifest V3 eliminates callback complexity with native promise support
 
 **Common Tasks**:
 - Create new framework bindings using the native RuntimeBindings interface
 - Handle browser-specific API differences (WXT vs raw Chrome APIs)
 - Implement custom sender types for different contexts
 - Debug callback vs Response.t conversion issues
+- Leverage Manifest V3 promise patterns for cleaner async code
 
 ### ReScript v12 Compilation Agent
 **Use this agent for**: ReScript compilation issues, module system, ES module output
@@ -167,7 +174,7 @@ module type RuntimeBindings = {
 
 ### Defining New Messages
 ```rescript
-// In any package that depends on re-webworker
+// In any package that depends on reworker
 type Types.message<_> +=
   | GetUserProfile(string): Types.message<Result.t<User.Profile.t, string>>
   | UpdateSettings(Settings.t): Types.message<Result.t<unit, string>>
@@ -260,6 +267,7 @@ MyRuntime.OnMessage.addListener(handler)
 ## Key Constraints
 
 - **JavaScript Message Passing**: Designed for environments with message passing capabilities (WebWorkers, ServiceWorkers, browser extensions)
+- **Manifest V3 Extensions**: Targets modern Chrome extensions with promise-based APIs
 - **ReScript v12**: Uses bleeding-edge ReScript features (GADTs, JSX v4)
 - **No Runtime Deps**: Must remain dependency-free for maximum compatibility
 - **Type Safety First**: All features prioritize compile-time type safety

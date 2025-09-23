@@ -1,6 +1,6 @@
-# Re-WebWorker Testing Guide
+# ReWorker Testing Guide
 
-This document describes the testing infrastructure for the re-webworker library.
+This document describes the testing infrastructure for the reworker library.
 
 ## Test Structure
 

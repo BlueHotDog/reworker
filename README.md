@@ -1,11 +1,11 @@
-# Re-WebWorker
+# ReWorker
 
 Type-safe message passing for Chrome extensions with automatic chunking. Zero dependencies.
 
 ## Install
 
 ```bash
-npm install @bluehotdog/re-webworker
+npm install @bluehotdog/reworker
 ```
 
 ## Usage
@@ -20,7 +20,16 @@ type Types.message<_> +=
 Send messages:
 ```rescript
 module Runtime = Runtime.Make(WxtRuntime)
-Runtime.sendMessage(GetUser("123"), user => Console.log(user))
+
+// Promise-based API
+Runtime.sendMessage(GetUser("123"))->Promise.then(user => Console.log(user))
+
+// With async/await
+let user = await Runtime.sendMessage(GetUser("123"))
+Console.log(user)
+
+// Fire-and-forget
+Runtime.cast(SaveData(userData))
 ```
 
 Handle messages:
@@ -34,10 +43,18 @@ let handler = (msg, _sender) => {
 }
 Runtime.OnMessage.addListener(handler)
 ```
+Build a nice wrapper:
+In your background.res:
+```rescript
+let getUser = (userid)=> Runtime.sendMessage(GetUser(userid))
+```
+This allows callers to just do `let user = await Background.getUser("123")`
+Simple. Clear.
 
 ## Features
 
 - **Type safety**: GADTs ensure request/response type matching
+- **Promise-based**: Native Manifest V3 promise support with async/await
 - **Auto-chunking**: Handles Chrome's 64MB message limits transparently
 - **Framework agnostic**: Works with any Chrome extension framework
 - **Zero deps**: Pure ReScript library

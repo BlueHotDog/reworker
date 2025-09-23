@@ -8,7 +8,7 @@
 
 module type RuntimeBindings = {
   type sender
-  let sendMessage: ('a, 'b => unit) => unit
+  let sendMessage: 'a => Promise.t<'b>
   module OnMessage: {
     let addListener: (('a, sender, 'b => unit) => bool) => unit
     let removeListener: (('a, sender, 'b => unit) => bool) => unit
@@ -22,35 +22,28 @@ module Make = (Bindings: RuntimeBindings) => {
   module HandlerMap = RequestHandler__Map
 
   let sendMessage:
-    type a. (Types.message<a>, a => unit) => unit =
-    (message, responseHandler) => {
+    type a. Types.message<a> => Promise.t<a> =
+    message => {
       if message->MessageChunker.shouldBeChunked {
-        let chunks = TransportMessage.createChunks(message)
-        chunks->Array.forEach(chunkTransportMessage => {
-          switch chunkTransportMessage {
-          | TransportMessage.IntermediateChunk(chunk) =>
-            Bindings.sendMessage(chunkTransportMessage, chunkAck => {
-              switch chunkAck {
-              | TransportMessage.ChunkAck(ackId)
-                if ackId === chunk->TransportMessage.Chunk.messageId => ()
-              | _ => assert(false)
+        let finalResp = ref(None)
+        TransportMessage.createChunks(message)
+        ->Array.mapWithIndex((chunkTransportMessage, index) => {
+          Bindings.sendMessage(chunkTransportMessage)->Promise.thenResolve(response => {
+            switch chunkTransportMessage {
+            | TransportMessage.FinalChunk(_chunk) => {
+                finalResp := Some(response)
+                ()
               }
-            })
-
-          | TransportMessage.FinalChunk(_chunk) =>
-            Bindings.sendMessage(chunkTransportMessage, originalResponse => {
-              responseHandler(originalResponse)
-            })
-
-          | TransportMessage.UserMessage(_) => assert(false) // Should not happen in chunk array
-          }
+            | _ => ()
+            }
+            (index, chunkTransportMessage, response)
+          })
         })
+        ->Promise.all(_)
+        ->Promise.thenResolve(_results => finalResp.contents->Option.getOrThrow)
       } else {
-        // Send message directly as transport message
         let transportMessage = TransportMessage.UserMessage(message)
-        Bindings.sendMessage(transportMessage, originalResponse => {
-          responseHandler(originalResponse)
-        })
+        Bindings.sendMessage(transportMessage)
       }
     }
 
@@ -58,7 +51,7 @@ module Make = (Bindings: RuntimeBindings) => {
   let cast:
     type a. Types.message<a> => unit =
     message => {
-      sendMessage(message, _response => ())
+      sendMessage(message)->Promise.ignore
     }
 
   // Message subscription with automatic chunk reassembly
@@ -67,7 +60,11 @@ module Make = (Bindings: RuntimeBindings) => {
       type a. ((Types.message<a>, Bindings.sender) => Response.t<a>) => unit =
       userResponseHandler => {
         let messageHandler = (transportMessage, sender, sendResponse) => {
-          let response = RequestHandler.make(~userHandler=userResponseHandler, transportMessage, sender)
+          let response = RequestHandler.make(
+            ~userHandler=userResponseHandler,
+            transportMessage,
+            sender,
+          )
 
           // Convert Response.t to Chrome callback pattern
           switch response {

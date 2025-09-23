@@ -1,5 +1,5 @@
 {
-	"name": "@bluehotdog/re-webworker",
+	"name": "@bluehotdog/reworker",
 	"version": "0.0.1",
 	"description": "Type-safe, chunked message passing for WebWorkers, ServiceWorkers, and browser extensions using GADTs with zero runtime dependencies",
 	"keywords": [

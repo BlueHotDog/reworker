@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-// Test runner for all re-webworker tests
+// Test runner for all reworker tests
 // Executes all test suites and provides summary
 
 let runAllTests = async () => {
-  Console.log("🧪 Re-WebWorker Test Suite")
+  Console.log("🧪 ReWorker Test Suite")
   Console.log("="->String.repeat(50))
 
   let startTime = Date.now()
@@ -74,7 +74,7 @@ let runAllTests = async () => {
 
   if passedCount === totalCount {
     Console.log("🎉 All test suites passed!")
-    Console.log("\n✨ Re-WebWorker library is ready for production!")
+    Console.log("\n✨ ReWorker library is ready for production!")
   } else {
     Console.error("💥 Some test suites failed!")
     Console.log("\n🔧 Please review and fix failing tests before using the library.")

@@ -1,4 +1,4 @@
-# Task runner Makefile for @bluehotdog/re-webworker
+# Task runner Makefile for @bluehotdog/reworker
 #
 # Usage: make [target]
 # Run 'make help' to see available commands

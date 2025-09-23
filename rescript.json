@@ -1,5 +1,5 @@
 {
-	"name": "@bluehotdog/re-webworker",
+	"name": "@bluehotdog/reworker",
 	"sources": {
 		"dir": "src",
 		"subdirs": true
