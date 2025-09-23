@@ -1,0 +1,12 @@
+# Global ownership
+* @bluehotdog
+
+# Core library files require extra scrutiny
+/src/ @bluehotdog
+/package.json @bluehotdog
+/bsconfig.json @bluehotdog
+
+# Release and CI configuration
+/.github/ @bluehotdog
+/CHANGELOG.md @bluehotdog
+/CLAUDE.md @bluehotdog
