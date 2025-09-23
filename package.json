@@ -38,7 +38,7 @@
 		"TESTING.md"
 	],
 	"engines": {
-		"node": ">=18"
+		"node": ">=20.11.0"
 	},
 	"sideEffects": false,
 	"dependencies": {},
