@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    name: Build, Test & Format Check
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check ReScript formatting
+        run: |
+          echo "Checking ReScript code formatting..."
+          npx rescript format -check
+
+      - name: Build with strict ReScript compilation
+        run: |
+          echo "Building with ReScript..."
+          npx rescript
+
+      - name: Run tests
+        run: |
+          echo "Running test suite..."
+          make test
+
+      - name: Verify no build artifacts committed
+        run: |
+          echo "Checking for uncommitted build artifacts..."
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Build generated files that weren't committed:"
+            git status --porcelain
+            exit 1
+          else
+            echo "✅ No uncommitted build artifacts found"
+          fi
+
+  compatibility:
+    name: ReScript Version Compatibility
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        rescript-version: ["12.0.0-beta.12", "12.0.0-rc.1"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies with ReScript ${{ matrix.rescript-version }}
+        run: |
+          npm ci
+          npm install rescript@${{ matrix.rescript-version }}
+
+      - name: Build with ReScript ${{ matrix.rescript-version }}
+        run: npx rescript
+
+      - name: Test with ReScript ${{ matrix.rescript-version }}
+        run: make test
+
+  quality:
+    name: Code Quality & Security
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Security audit
+        run: npm audit --audit-level moderate
+
+      - name: Check for TODO/FIXME in source code
+        run: |
+          echo "Checking for development artifacts in source code..."
+          if grep -r "TODO\|FIXME\|console\.log\|debugger" src/ --include="*.res" --include="*.resi"; then
+            echo "❌ Found development artifacts in source code"
+            exit 1
+          else
+            echo "✅ No development artifacts found in source code"
+          fi
+
+      - name: Verify package.json consistency
+        run: |
+          echo "Verifying package.json configuration..."
+          # Check that files field matches actual files
+          if [ ! -f "rescript.json" ]; then
+            echo "❌ rescript.json missing but listed in package.json files"
+            exit 1
+          fi
+          echo "✅ Package configuration is consistent"

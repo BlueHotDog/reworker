@@ -59,6 +59,7 @@ npm install @bluehotdog/re-webworker
 **Requirements:**
 - ReScript ^12.0.0-beta.12
 - JavaScript environment with message passing support (WebWorkers, ServiceWorkers, browser extensions)
+- **Browser Extensions**: Manifest V3 only (Manifest V2 is deprecated and not supported)
 
 ## 🔧 Quick Start
 
@@ -394,6 +395,10 @@ ReScript values compile to stable JavaScript objects, making debugging straightf
 1. **Issues**: Report bugs or request features via GitHub issues
 2. **Development**: Follow the agent specialization guide in `AGENTS.md`
 3. **Testing**: All PRs must include tests and pass existing test suite
+
+## 🙏 Thanks
+
+Special thanks to [@diogomqbm](https://github.com/diogomqbm) for inspiration and foundational work that helped shape this library's approach to type-safe message passing and chunking strategies.
 
 ## 📄 License
 

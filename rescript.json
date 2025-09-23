@@ -10,5 +10,10 @@
 	},
 	"suffix": ".res.mjs",
 	"dependencies": [],
-	"compiler-flags": []
+	"compiler-flags": [
+		"-w",
+		"+A-4-9-18-40-41-42-50-61-102",
+		"-warn-error",
+		"+A-4-9-18-40-41-42-50-61-102"
+	]
 }
