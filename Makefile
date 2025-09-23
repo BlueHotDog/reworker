@@ -4,7 +4,7 @@
 # Run 'make help' to see available commands
 
 .DEFAULT_GOAL := help
-.PHONY: help install build clean dev test lint format check publish
+.PHONY: help install build clean dev test lint format check publish setup-hooks
 
 # Colors for output
 CYAN := \033[36m
@@ -62,3 +62,15 @@ publish: check ## Publish package to npm
 
 check: build test ## Run all checks (build + test)
 	@printf "$(GREEN)All checks passed!$(RESET)\n"
+
+setup-hooks: ## Set up git pre-commit hooks
+	@printf "$(YELLOW)Setting up git hooks...$(RESET)\n"
+	@echo '#!/bin/bash' > .git/hooks/pre-commit
+	@echo 'echo "Running pre-commit checks..."' >> .git/hooks/pre-commit
+	@echo 'make check' >> .git/hooks/pre-commit
+	@echo 'if [ $$? -ne 0 ]; then' >> .git/hooks/pre-commit
+	@echo '  echo "Pre-commit checks failed. Commit aborted."' >> .git/hooks/pre-commit
+	@echo '  exit 1' >> .git/hooks/pre-commit
+	@echo 'fi' >> .git/hooks/pre-commit
+	@chmod +x .git/hooks/pre-commit
+	@printf "$(GREEN)Git hooks installed!$(RESET)\n"
