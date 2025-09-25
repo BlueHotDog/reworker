@@ -1,3 +1,4 @@
+@@warning("-4")
 /*
  * Copyright 2025 BlueHotDog
  * SPDX-License-Identifier: MIT
@@ -39,10 +40,13 @@ module MockBindings = {
 
     let removeListener: (('a, sender, 'b => unit) => bool) => unit = handler => {
       // Check if handler exists in stored handlers
-      let exists = Array.some(storedHandlers.contents, stored => Obj.magic(stored) === Obj.magic(handler))
+      let exists = Array.some(storedHandlers.contents, stored =>
+        Obj.magic(stored) === Obj.magic(handler)
+      )
       if exists {
         removedListenerCount := removedListenerCount.contents + 1
-        storedHandlers := Array.filter(storedHandlers.contents, stored => Obj.magic(stored) !== Obj.magic(handler))
+        storedHandlers :=
+          Array.filter(storedHandlers.contents, stored => Obj.magic(stored) !== Obj.magic(handler))
       }
     }
   }
@@ -75,10 +79,12 @@ let testSendMessagePassthrough = () => {
   let responseReceived = ref(None)
 
   try {
-    TestRuntime.sendMessage(testMessage)->Promise.then(response => {
+    TestRuntime.sendMessage(testMessage)
+    ->Promise.then(response => {
       responseReceived := Some(response)
       Promise.resolve()
-    })->ignore
+    })
+    ->ignore
 
     let sentCount = MockBindings.sentMessageCount.contents
     if sentCount === 1 {
@@ -267,12 +273,14 @@ let testChunkedMessageOutOfOrder = () => {
   // More sophisticated out-of-order testing would require complex mock setup
   try {
     // Create a large message that will be chunked
-    let largeMessage = "A" ->String.repeat(MessageChunker.defaultChunkSize + 1000)
+    let largeMessage = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
     let testMessage = SimpleTest(largeMessage)
 
-    TestRuntime.sendMessage(testMessage)->Promise.then(_response => {
+    TestRuntime.sendMessage(testMessage)
+    ->Promise.then(_response => {
       Promise.resolve()
-    })->ignore
+    })
+    ->ignore
 
     Console.log("PASS: Chunked message handled")
     true
@@ -291,10 +299,12 @@ let testBasicChunkedMessage = () => {
     let largeMessage = "B"->String.repeat(MessageChunker.defaultChunkSize + 1000)
     let testMessage = SimpleTest(largeMessage)
 
-    TestRuntime.sendMessage(testMessage)->Promise.then(_response => {
+    TestRuntime.sendMessage(testMessage)
+    ->Promise.then(_response => {
       Console.log("PASS: Large message handled (basic chunking)")
       Promise.resolve()
-    })->ignore
+    })
+    ->ignore
 
     true
   } catch {
@@ -423,7 +433,9 @@ let testRemoveListenerDuplicate = () => {
         Console.log("PASS: removeListener removes one instance of duplicate handler")
         true
       } else {
-        Console.error(`FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`)
+        Console.error(
+          `FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`,
+        )
         false
       }
     }
@@ -472,7 +484,9 @@ let testRemoveListenerDifferentTypes = () => {
         Console.log("PASS: removeListener works with different message types")
         true
       } else {
-        Console.error(`FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`)
+        Console.error(
+          `FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`,
+        )
         false
       }
     }

@@ -1,3 +1,4 @@
+@@warning("-4")
 /*
  * Copyright 2025 BlueHotDog
  * SPDX-License-Identifier: MIT

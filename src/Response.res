@@ -7,9 +7,9 @@
 // Provides a unified interface for immediate, async, and no-response patterns
 
 type t<'a> =
-  | RespondNow('a)         // Immediate response with value
+  | RespondNow('a) // Immediate response with value
   | RespondLater(promise<'a>) // Async response with promise
-  | NoResponse             // Handler processed message but no response needed
+  | NoResponse // Handler processed message but no response needed
 
 // Convenience constructors
 let now = value => RespondNow(value)
@@ -20,20 +20,23 @@ let none = NoResponse
 let isImmediate = response => {
   switch response {
   | RespondNow(_) => true
-  | _ => false
+  | RespondLater(_) => false
+  | NoResponse => false
   }
 }
 
 let isAsync = response => {
   switch response {
   | RespondLater(_) => true
-  | _ => false
+  | NoResponse => false
+  | RespondNow(_) => false
   }
 }
 
 let hasResponse = response => {
   switch response {
   | NoResponse => false
-  | _ => true
+  | RespondLater(_) => true
+  | RespondNow(_) => true
   }
 }

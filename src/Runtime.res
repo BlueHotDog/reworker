@@ -19,8 +19,6 @@ module type RuntimeBindings = {
 }
 
 module Make = (Bindings: RuntimeBindings) => {
-  module RequestHandlerMap = RequestHandler__Map
-
   // Type-safe handler mapping for removeListener functionality
   let handlerToWrapped: HandlerMap.t = HandlerMap.make()
 
@@ -37,7 +35,8 @@ module Make = (Bindings: RuntimeBindings) => {
                 finalResp := Some(response)
                 ()
               }
-            | _ => ()
+            | TransportMessage.UserMessage(_) => assert(false)
+            | TransportMessage.IntermediateChunk(_) => assert(false)
             }
             (index, chunkTransportMessage, response)
           })

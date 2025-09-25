@@ -32,7 +32,6 @@ module Chunk = {
   let messageId = chunk => chunk.messageId
   let index = chunk => chunk.index
   let total = chunk => chunk.total
-  let body = chunk => chunk.body
   let isLast = chunk => chunk.index === chunk.total - 1
 }
 
