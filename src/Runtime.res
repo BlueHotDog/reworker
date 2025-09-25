@@ -13,9 +13,29 @@ module type RuntimeBindings = {
     let addListener: (('a, sender, 'b => unit) => bool) => unit
     let removeListener: (('a, sender, 'b => unit) => bool) => unit
   }
-
-  // Runtime ID for context validation
   let getRuntimeId: unit => option<string>
+
+  // Port capabilities
+  type port
+  let connect: (~extensionId: string=?, ~name: string=?) => option<port>
+  let connectToTab: (~tabId: int, ~frameId: int=?, ~name: string=?) => option<port>
+
+  module Port: {
+    let postMessage: (port, 'a) => result<unit, string>
+    let disconnect: port => unit
+    let name: port => option<string>
+    let sender: port => option<'sender>
+
+    module OnMessage: {
+      let addListener: (port, 'a => unit) => result<unit, string>
+      let removeListener: (port, 'a => unit) => result<unit, string>
+    }
+
+    module OnDisconnect: {
+      let addListener: (port, port => unit) => result<unit, string>
+      let removeListener: (port, port => unit) => result<unit, string>
+    }
+  }
 }
 
 module Make = (Bindings: RuntimeBindings) => {
