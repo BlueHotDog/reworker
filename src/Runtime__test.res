@@ -53,12 +53,119 @@ module MockBindings = {
 
   let getRuntimeId = () => Some("mock-runtime-id")
 
+  // Port capabilities with full mock implementation
+  type mockPort = {
+    id: string,
+    name: option<string>,
+    isConnected: ref<bool>,
+  }
+
+  type port = mockPort
+
+  let portConnectCount = ref(0)
+  let portPostCount = ref(0)
+  let portDisconnectCount = ref(0)
+  let activePortsCount = ref(0)
+  let storedPortHandlers: ref<array<Obj.t>> = ref([])
+
+  let connect = (~extensionId=?, ~name=?) => {
+    ignore(extensionId)
+    portConnectCount := portConnectCount.contents + 1
+    activePortsCount := activePortsCount.contents + 1
+    Some({
+      id: `mock-port-${portConnectCount.contents->Int.toString}`,
+      name,
+      isConnected: ref(true),
+    })
+  }
+
+  let connectToTab = (~tabId, ~frameId=?, ~name=?) => {
+    ignore(frameId)
+    portConnectCount := portConnectCount.contents + 1
+    activePortsCount := activePortsCount.contents + 1
+    Some({
+      id: `mock-tab-port-${tabId->Int.toString}-${portConnectCount.contents->Int.toString}`,
+      name,
+      isConnected: ref(true),
+    })
+  }
+
+  module Port = {
+    let postMessage = (port, message) => {
+      ignore(message)
+      if port.isConnected.contents {
+        portPostCount := portPostCount.contents + 1
+        Ok()
+      } else {
+        Error("Port is disconnected")
+      }
+    }
+
+    let disconnect = port => {
+      if port.isConnected.contents {
+        port.isConnected := false
+        portDisconnectCount := portDisconnectCount.contents + 1
+        activePortsCount := activePortsCount.contents - 1
+      }
+    }
+
+    let name = port => port.name
+
+    let sender = port => {
+      ignore(port)
+      None // Simplified mock - no port sender for now
+    }
+
+    module OnMessage = {
+      let addListener = (port, handler) => {
+        ignore(port)
+        storedPortHandlers := Array.concat(storedPortHandlers.contents, [Obj.magic(handler)])
+        Ok()
+      }
+
+      let removeListener = (port, handler) => {
+        ignore(port)
+        let exists = Array.some(storedPortHandlers.contents, stored =>
+          Obj.magic(stored) === Obj.magic(handler)
+        )
+        if exists {
+          storedPortHandlers :=
+            Array.filter(storedPortHandlers.contents, stored =>
+              Obj.magic(stored) !== Obj.magic(handler)
+            )
+          Ok()
+        } else {
+          Error("Handler not found")
+        }
+      }
+    }
+
+    module OnDisconnect = {
+      let addListener = (port, handler) => {
+        ignore(port)
+        ignore(handler)
+        Ok()
+      }
+
+      let removeListener = (port, handler) => {
+        ignore(port)
+        ignore(handler)
+        Ok()
+      }
+    }
+  }
+
   // Helper to reset mock state
   let reset = () => {
     sentMessageCount := 0
     addedListenerCount := 0
     removedListenerCount := 0
     storedHandlers := []
+    portConnectCount := 0
+    portPostCount := 0
+    portDisconnectCount := 0
+    activePortsCount := 0
+    storedPortHandlers := []
   }
 }
 
@@ -561,6 +668,8 @@ let runTests = () => {
 
   TestUtils.runSyncTests("Runtime Integration Tests", tests)
 }
+
+
 
 // Export for running
 let main = runTests
