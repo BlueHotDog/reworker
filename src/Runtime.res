@@ -13,8 +13,6 @@ module type RuntimeBindings = {
     let addListener: (('a, sender, 'b => unit) => bool) => unit
     let removeListener: (('a, sender, 'b => unit) => bool) => unit
   }
-
-  // Runtime ID for context validation
   let getRuntimeId: unit => option<string>
 }
 
