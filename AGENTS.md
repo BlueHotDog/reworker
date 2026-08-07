@@ -1,37 +1,44 @@
 # ReWorker
 
 `@bluehotdog/reworker` is a dependency-free ReScript library for type-safe,
-chunked message passing in workers and browser extensions.
+chunked message passing in workers and Manifest V3 browser extensions.
 
 ## Architecture
 
 - `src/Types.res` defines the extensible `Types.message<_>` GADT. Each message
   constructor determines its response type.
-- `src/Runtime.res` provides promise-based messaging through configurable
-  runtime bindings.
+- `src/Runtime.res` is a functor over environment-specific bindings. It provides
+  promise-based sending, fire-and-forget casts, listener management, and context
+  validity checks.
 - `src/TransportMessage.res`, `src/MessageChunker.res`, and
   `src/RequestHandler.res` implement transparent chunking and reassembly.
 - `src/Response.res` represents immediate, deferred, and absent responses.
-- `.resi` files define the public API and must stay synchronized with their
-  implementations.
+- `src/Channel.res` and `src/ChannelTypes.res` provide persistent port channels
+  for background and tab connections.
+- Tests are colocated in `src/*__test.res` and registered in
+  `src/TestRunner.res`.
 
 ## Invariants
 
-- Keep `TransportMessage` internal. Consumers send `Types.message<_>` values
-  and must not handle transport messages or chunks.
+- Keep transport details out of the consumer-facing runtime API. Consumers send
+  `Types.message<_>` values and must not handle chunks.
 - Preserve the request/response relationship encoded by the message GADT.
 - Keep the library free of runtime dependencies.
-- Prefer small, backward-compatible changes because this is a foundational
-  library.
+- Treat `.resi` files as API boundaries and update them with their
+  implementations when a public signature changes.
 - Test both direct and chunked message paths when changing transport behavior.
 
-## Development
+## Workflow
 
-- Use `make build` to compile.
-- Use `make test` to run the test suite.
-- Use `make format` to format ReScript files.
-- Use `make help` to list all commands.
+- Install dependencies with `npm ci`.
+- Compile with `make build`; warnings are treated as errors.
+- Run the complete test suite with `make test`.
+- Run dead code analysis with `make analyze`.
+- Format ReScript sources with `make format` and check formatting with
+  `npx rescript format --check`.
+- Edit `.res` and `.resi` sources, not generated `.res.mjs` files or `lib/`
+  artifacts.
+- Add new test modules to `src/TestRunner.res` so `make test` executes them.
 
-The project uses ReScript 12, ES modules, in-source compilation, and the
-`.res.mjs` suffix. See `README.md` for consumer usage and the relevant `.resi`
-file for the current API.
+The project requires Node.js 20.11 or newer and ReScript 12. It emits ES modules
+in source with the `.res.mjs` suffix. See `README.md` for consumer usage.

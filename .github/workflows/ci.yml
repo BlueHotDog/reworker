@@ -29,14 +29,15 @@ jobs:
         run: npm ci
 
       - name: Check ReScript formatting
-        run: |
-          echo "Checking ReScript code formatting..."
-          npx rescript format -check
+        run: npx rescript format --check
 
       - name: Build with strict ReScript compilation
         run: |
           echo "Building with ReScript..."
           npx rescript
+
+      - name: Run ReScript dead code analysis
+        run: npx rescript-tools reanalyze -config -ci
 
       - name: Run tests
         run: |
@@ -60,7 +61,7 @@ jobs:
 
     strategy:
       matrix:
-        rescript-version: ["12.0.0-beta.11", "12.0.0-beta.12"]
+        rescript-version: ["12.0.0", "12.3.0"]
 
     steps:
       - name: Checkout code
@@ -75,7 +76,7 @@ jobs:
       - name: Install dependencies with ReScript ${{ matrix.rescript-version }}
         run: |
           npm ci
-          npm install rescript@${{ matrix.rescript-version }}
+          npm install --no-save rescript@${{ matrix.rescript-version }}
 
       - name: Build with ReScript ${{ matrix.rescript-version }}
         run: npx rescript
@@ -122,3 +123,6 @@ jobs:
             exit 1
           fi
           echo "✅ Package configuration is consistent"
+
+      - name: Inspect package contents
+        run: npm pack --dry-run

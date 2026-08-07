@@ -16,8 +16,8 @@ let createTestMessage = content => {
   }
 }
 
-// Test: Small message creates UserMessage variant
-let testSmallMessageCreatesUserMessage = () => {
+// Test: A single chunk is represented as the final chunk
+let testSmallMessageCreatesFinalChunk = () => {
   let smallMessage = createTestMessage("small")
 
   try {
@@ -25,8 +25,8 @@ let testSmallMessageCreatesUserMessage = () => {
 
     if chunks->Array.length === 1 {
       switch chunks[0] {
-      | Some(TransportMessage.UserMessage(_)) =>
-        Console.log("PASS: Small message creates UserMessage variant")
+      | Some(TransportMessage.FinalChunk(_)) =>
+        Console.log("PASS: Small message creates one final chunk")
         true
       | Some(_) =>
         Console.error("FAIL: Small message created wrong variant")
@@ -284,7 +284,7 @@ let testChunkOrderIndependence = () => {
 // Run all tests
 let runTests = () => {
   let tests = [
-    ("Small message creates UserMessage", testSmallMessageCreatesUserMessage),
+    ("Small message creates one final chunk", testSmallMessageCreatesFinalChunk),
     ("Large message creates chunks", testLargeMessageCreatesChunks),
     ("Chunk metadata consistency", testChunkMetadataConsistency),
     ("Chunk reassembly", testChunkReassembly),

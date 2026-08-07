@@ -33,8 +33,7 @@ module Make = (Bindings: RuntimeBindings) => {
                 finalResp := Some(response)
                 ()
               }
-            | TransportMessage.UserMessage(_) => assert(false)
-            | TransportMessage.IntermediateChunk(_) => assert(false)
+            | TransportMessage.UserMessage(_) | TransportMessage.IntermediateChunk(_) => ()
             }
             (index, chunkTransportMessage, response)
           })

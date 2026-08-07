@@ -8,6 +8,7 @@ type channelId
 
 let makeChannelId: Id.t => channelId
 type channelState<'port> = {
+  @live
   channelName: channelId,
   port: 'port,
   isConnected: ref<bool>,

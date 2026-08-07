@@ -4,7 +4,7 @@
 # Run 'make help' to see available commands
 
 .DEFAULT_GOAL := help
-.PHONY: help install build clean dev test lint format check publish setup-hooks
+.PHONY: help install build clean dev test analyze lint format check publish setup-hooks
 
 # Colors for output
 CYAN := \033[36m
@@ -40,6 +40,11 @@ test: build ## Run all tests
 	node src/TestRunner.res.mjs
 	@printf "$(GREEN)Tests complete!$(RESET)\n"
 
+analyze: build ## Run ReScript dead code analysis
+	@printf "$(YELLOW)Analyzing ReScript code...$(RESET)\n"
+	npx rescript-tools reanalyze -config -ci
+	@printf "$(GREEN)Analysis complete!$(RESET)\n"
+
 lint: ## Run linters and code formatters
 	@printf "$(YELLOW)Running linters...$(RESET)\n"
 	# ReScript has built-in formatting - no additional linting needed
@@ -60,7 +65,7 @@ publish: check ## Publish package to npm
 	npm publish
 	@printf "$(GREEN)Package published!$(RESET)\n"
 
-check: build test ## Run all checks (build + test)
+check: test analyze ## Run all checks (build + test + analysis)
 	@printf "$(GREEN)All checks passed!$(RESET)\n"
 
 setup-hooks: ## Set up git pre-commit hooks

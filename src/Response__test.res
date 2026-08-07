@@ -38,7 +38,7 @@ let testPromiseResolutionTiming = async () => {
     try {
       let result = await resultPromise
       let endTime = Date.now()
-      let elapsed = endTime -. startTime
+      let elapsed = endTime - startTime
 
       if result === expectedValue && elapsed >= Int.toFloat(delay - 10) {
         Console.log(`PASS: Promise resolved correctly after ${elapsed->Float.toString}ms`)
@@ -71,7 +71,7 @@ let testPromiseRejectionHandling = async () => {
   switch response {
   | Response.RespondLater(resultPromise) =>
     try {
-      let _result = await resultPromise
+      (await resultPromise)->ignore
       Console.error("FAIL: Promise should have rejected")
       false
     } catch {

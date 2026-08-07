@@ -29,6 +29,7 @@ module MakeToBackground = (
   type t = ChannelTypes.channelState<port>
 
   // Channel operations
+  @live
   let connect = (~extensionId=?) => {
     let channelId = Id.make()
     let channelNameString = Id.toString(channelId)
@@ -51,6 +52,7 @@ module MakeToBackground = (
     }
   }
 
+  @live
   let post:
     type a. (t, MessageSpec.message<a>) => result<unit, string> =
     (channel, message) => {
@@ -61,17 +63,20 @@ module MakeToBackground = (
       }
     }
 
+  @live
   let disconnect = channel => {
     (channel: ChannelTypes.channelState<port>).isConnected := false
     Bindings.Port.disconnect((channel: ChannelTypes.channelState<port>).port)
   }
 
+  @live
   let addHandler:
     type a. (t, MessageSpec.message<a> => unit) => unit =
     (channel, handler) => {
       Bindings.Port.OnMessage.addListener((channel: ChannelTypes.channelState<port>).port, handler)
     }
 
+  @live
   let removeHandler:
     type a. (t, MessageSpec.message<a> => unit) => unit =
     (channel, handler) => {
@@ -81,6 +86,7 @@ module MakeToBackground = (
       )
     }
 
+  @live
   let addDisconnectHandler = (channel, handler) => {
     Bindings.Port.OnDisconnect.addListener((channel: ChannelTypes.channelState<port>).port, handler)
   }
@@ -117,6 +123,7 @@ module MakeToTab = (
   type t = ChannelTypes.channelState<Bindings.port>
 
   // Connect requires tabId (different from background connections)
+  @live
   let connect = (~tabId, ~frameId=?) => {
     switch Bindings.connectToTab(~tabId, ~frameId?, ~name=channelNameString) {
     | None => None
@@ -138,6 +145,7 @@ module MakeToTab = (
   }
 
   // post, disconnect, handlers identical to MakeToBackground
+  @live
   let post:
     type a. (t, MessageSpec.message<a>) => result<unit, string> =
     (channel, message) => {
@@ -148,11 +156,13 @@ module MakeToTab = (
       }
     }
 
+  @live
   let disconnect = channel => {
     (channel: ChannelTypes.channelState<Bindings.port>).isConnected := false
     Bindings.Port.disconnect((channel: ChannelTypes.channelState<Bindings.port>).port)
   }
 
+  @live
   let addHandler:
     type a. (t, MessageSpec.message<a> => unit) => result<unit, string> =
     (channel, handler) => {
@@ -162,6 +172,7 @@ module MakeToTab = (
       )
     }
 
+  @live
   let removeHandler:
     type a. (t, MessageSpec.message<a> => unit) => result<unit, string> =
     (channel, handler) => {
@@ -171,6 +182,7 @@ module MakeToTab = (
       )
     }
 
+  @live
   let addDisconnectHandler = (channel, handler) => {
     Bindings.Port.OnDisconnect.addListener(
       (channel: ChannelTypes.channelState<Bindings.port>).port,

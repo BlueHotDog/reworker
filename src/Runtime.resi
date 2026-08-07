@@ -16,7 +16,8 @@ module type RuntimeBindings = {
   let getRuntimeId: unit => option<string>
 }
 
-module Make: (Bindings: RuntimeBindings) => {
+module Make: (Bindings: RuntimeBindings) =>
+{
   let sendMessage: Types.message<'a> => Promise.t<'a>
   let cast: Types.message<'a> => unit
   module OnMessage: {

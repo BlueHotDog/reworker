@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Upgrade the development compiler from ReScript 12 beta to ReScript 12.3
+- Support all stable ReScript 12 releases
+- Restrict the supported package surface to consumer-facing modules
+- Use ReScript 12's structured warning configuration and unified operators
+- Make the test runner propagate failures to the calling process
+- Run ReScript dead code analysis in local checks and CI
+- Remove an unused handler-map module and obsolete runtime test mocks
+
 ### Added
 - Initial implementation of type-safe Chrome extension message passing
 - GADT-based message system with compile-time type safety

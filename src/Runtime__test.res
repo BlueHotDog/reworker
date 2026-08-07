@@ -9,10 +9,7 @@
 
 // Mock bindings for testing
 module MockBindings = {
-  type sender = {
-    id: string,
-    context: string,
-  }
+  type sender = unit
 
   // Store sent messages count for verification
   let sentMessageCount = ref(0)
@@ -53,119 +50,12 @@ module MockBindings = {
 
   let getRuntimeId = () => Some("mock-runtime-id")
 
-  // Port capabilities with full mock implementation
-  type mockPort = {
-    id: string,
-    name: option<string>,
-    isConnected: ref<bool>,
-  }
-
-  type port = mockPort
-
-  let portConnectCount = ref(0)
-  let portPostCount = ref(0)
-  let portDisconnectCount = ref(0)
-  let activePortsCount = ref(0)
-  let storedPortHandlers: ref<array<Obj.t>> = ref([])
-
-  let connect = (~extensionId=?, ~name=?) => {
-    ignore(extensionId)
-    portConnectCount := portConnectCount.contents + 1
-    activePortsCount := activePortsCount.contents + 1
-    Some({
-      id: `mock-port-${portConnectCount.contents->Int.toString}`,
-      name,
-      isConnected: ref(true),
-    })
-  }
-
-  let connectToTab = (~tabId, ~frameId=?, ~name=?) => {
-    ignore(frameId)
-    portConnectCount := portConnectCount.contents + 1
-    activePortsCount := activePortsCount.contents + 1
-    Some({
-      id: `mock-tab-port-${tabId->Int.toString}-${portConnectCount.contents->Int.toString}`,
-      name,
-      isConnected: ref(true),
-    })
-  }
-
-  module Port = {
-    let postMessage = (port, message) => {
-      ignore(message)
-      if port.isConnected.contents {
-        portPostCount := portPostCount.contents + 1
-        Ok()
-      } else {
-        Error("Port is disconnected")
-      }
-    }
-
-    let disconnect = port => {
-      if port.isConnected.contents {
-        port.isConnected := false
-        portDisconnectCount := portDisconnectCount.contents + 1
-        activePortsCount := activePortsCount.contents - 1
-      }
-    }
-
-    let name = port => port.name
-
-    let sender = port => {
-      ignore(port)
-      None // Simplified mock - no port sender for now
-    }
-
-    module OnMessage = {
-      let addListener = (port, handler) => {
-        ignore(port)
-        storedPortHandlers := Array.concat(storedPortHandlers.contents, [Obj.magic(handler)])
-        Ok()
-      }
-
-      let removeListener = (port, handler) => {
-        ignore(port)
-        let exists = Array.some(storedPortHandlers.contents, stored =>
-          Obj.magic(stored) === Obj.magic(handler)
-        )
-        if exists {
-          storedPortHandlers :=
-            Array.filter(storedPortHandlers.contents, stored =>
-              Obj.magic(stored) !== Obj.magic(handler)
-            )
-          Ok()
-        } else {
-          Error("Handler not found")
-        }
-      }
-    }
-
-    module OnDisconnect = {
-      let addListener = (port, handler) => {
-        ignore(port)
-        ignore(handler)
-        Ok()
-      }
-
-      let removeListener = (port, handler) => {
-        ignore(port)
-        ignore(handler)
-        Ok()
-      }
-    }
-  }
-
   // Helper to reset mock state
   let reset = () => {
     sentMessageCount := 0
     addedListenerCount := 0
     removedListenerCount := 0
     storedHandlers := []
-    portConnectCount := 0
-    portPostCount := 0
-    portDisconnectCount := 0
-    activePortsCount := 0
-    storedPortHandlers := []
   }
 }
 
@@ -179,22 +69,15 @@ type Types.message<_> +=
 module TestRuntime = Runtime.Make(MockBindings)
 
 // Test: sendMessage passes through to bindings
-let testSendMessagePassthrough = () => {
+let testSendMessagePassthrough = async () => {
   MockBindings.reset()
 
   let testMessage = SimpleTest("send test")
-  let responseReceived = ref(None)
-
   try {
-    TestRuntime.sendMessage(testMessage)
-    ->Promise.then(response => {
-      responseReceived := Some(response)
-      Promise.resolve()
-    })
-    ->ignore
+    let response = await TestRuntime.sendMessage(testMessage)
 
     let sentCount = MockBindings.sentMessageCount.contents
-    if sentCount === 1 {
+    if sentCount === 1 && response === "mock response" {
       Console.log("PASS: sendMessage passed through to bindings")
       true
     } else {
@@ -375,22 +258,21 @@ let testErrorHandlingInUserHandler = () => {
 }
 
 // Test: Chunked message handling with out-of-order responses
-let testChunkedMessageOutOfOrder = () => {
-  // For now, just test that chunked messages work at all
-  // More sophisticated out-of-order testing would require complex mock setup
+let testChunkedMessage = async () => {
+  MockBindings.reset()
+
   try {
-    // Create a large message that will be chunked
     let largeMessage = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
     let testMessage = SimpleTest(largeMessage)
+    let response = await TestRuntime.sendMessage(testMessage)
 
-    TestRuntime.sendMessage(testMessage)
-    ->Promise.then(_response => {
-      Promise.resolve()
-    })
-    ->ignore
-
-    Console.log("PASS: Chunked message handled")
-    true
+    if MockBindings.sentMessageCount.contents > 1 && response === "mock response" {
+      Console.log("PASS: Chunked message handled")
+      true
+    } else {
+      Console.error("FAIL: Chunked message did not send all chunks or return the final response")
+      false
+    }
   } catch {
   | error =>
     Console.error2("FAIL: Exception during chunked message test:", error)
@@ -399,21 +281,21 @@ let testChunkedMessageOutOfOrder = () => {
 }
 
 // Test: Basic chunked message handling
-let testBasicChunkedMessage = () => {
+let testBasicChunkedMessage = async () => {
   MockBindings.reset()
 
   try {
     let largeMessage = "B"->String.repeat(MessageChunker.defaultChunkSize + 1000)
     let testMessage = SimpleTest(largeMessage)
 
-    TestRuntime.sendMessage(testMessage)
-    ->Promise.then(_response => {
+    let response = await TestRuntime.sendMessage(testMessage)
+    if response === "mock response" {
       Console.log("PASS: Large message handled (basic chunking)")
-      Promise.resolve()
-    })
-    ->ignore
-
-    true
+      true
+    } else {
+      Console.error("FAIL: Large message returned the wrong response")
+      false
+    }
   } catch {
   | error =>
     Console.error2("FAIL: Exception during basic chunked test:", error)
@@ -647,9 +529,8 @@ let testRemoveListenerMemoryBehavior = () => {
 }
 
 // Run all tests
-let runTests = () => {
-  let tests = [
-    ("sendMessage passthrough", testSendMessagePassthrough),
+let runTests = async () => {
+  let syncTests = [
     ("cast fire-and-forget", testCastFireAndForget),
     ("addListener conversion", testAddListenerConversion),
     ("RespondNow conversion", testRespondNowConversion),
@@ -657,8 +538,6 @@ let runTests = () => {
     ("NoResponse conversion", testNoResponseConversion),
     ("isContextValid utility", testIsContextValid),
     ("Error handling in user handler", testErrorHandlingInUserHandler),
-    ("Chunked message handling", testChunkedMessageOutOfOrder),
-    ("Basic chunked message", testBasicChunkedMessage),
     ("removeListener basic functionality", testRemoveListenerBasic),
     ("removeListener non-existent handler", testRemoveListenerNonExistent),
     ("removeListener duplicate handler", testRemoveListenerDuplicate),
@@ -666,10 +545,14 @@ let runTests = () => {
     ("removeListener memory behavior", testRemoveListenerMemoryBehavior),
   ]
 
-  TestUtils.runSyncTests("Runtime Integration Tests", tests)
+  let asyncTests = [
+    ("sendMessage passthrough", testSendMessagePassthrough),
+    ("Chunked message handling", testChunkedMessage),
+    ("Basic chunked message", testBasicChunkedMessage),
+  ]
+
+  await TestUtils.runMixedTests("Runtime Integration Tests", syncTests, asyncTests)
 }
-
-
 
 // Export for running
 let main = runTests

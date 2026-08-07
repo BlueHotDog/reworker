@@ -12,7 +12,7 @@ let createLargeString = size => {
   let charArray = chars->String.split("")
   Array.fromInitializer(~length=size, i => {
     let arrayLength = charArray->Array.length
-    let index = mod(i, arrayLength)
+    let index = i % arrayLength
     charArray[index]->Option.getOr("a")
   })->Array.join("")
 }
@@ -47,9 +47,10 @@ let testLargeMessageChunked = () => {
 
 // Test: Messages exactly at threshold
 let testThresholdBoundary = () => {
-  let exactThreshold = createLargeString(MessageChunker.defaultChunkSize)
-  let justOver = createLargeString(MessageChunker.defaultChunkSize + 1)
-  let justUnder = createLargeString(MessageChunker.defaultChunkSize - 1)
+  // JSON serialization adds two quote bytes around these ASCII strings.
+  let exactThreshold = createLargeString(MessageChunker.defaultChunkSize - 2)
+  let justOver = createLargeString(MessageChunker.defaultChunkSize - 1)
+  let justUnder = createLargeString(MessageChunker.defaultChunkSize - 3)
 
   let exactShouldChunk = exactThreshold->MessageChunker.shouldBeChunked
   let overShouldChunk = justOver->MessageChunker.shouldBeChunked
@@ -58,8 +59,7 @@ let testThresholdBoundary = () => {
   let results = [
     (!underShouldChunk, "Just under threshold should not chunk"),
     (overShouldChunk, "Just over threshold should chunk"),
-    // Exact threshold behavior - let's see what the implementation does
-    (true, `Exact threshold chunks: ${exactShouldChunk ? "yes" : "no"}`),
+    (!exactShouldChunk, "Exact threshold should not chunk"),
   ]
 
   let allPassed = results->Array.every(((passed, message)) => {

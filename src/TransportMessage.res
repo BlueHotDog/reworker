@@ -55,5 +55,7 @@ let createChunks = (message: 'a, ~size=MessageChunker.defaultChunkSize) => {
 }
 
 let reassembleChunks = (chunks: array<chunk>) => {
-  chunks->Array.map(chunk => chunk.body)->Array.join("")
+  let orderedChunks = chunks->Array.copy
+  orderedChunks->Array.sort((left, right) => Int.compare(left.index, right.index))
+  orderedChunks->Array.map(chunk => chunk.body)->Array.join("")
 }

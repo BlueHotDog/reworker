@@ -30,12 +30,14 @@
 	"files": [
 		"src/**/*.res",
 		"src/**/*.resi",
+		"!src/**/*__test.res",
+		"!src/TestRunner.res",
+		"!src/TestUtils.res",
 		"rescript.json",
 		"README.md",
 		"LICENSE",
 		"CHANGELOG.md",
-		"AGENTS.md",
-		"TESTING.md"
+		"AGENTS.md"
 	],
 	"engines": {
 		"node": ">=20.11.0"
@@ -43,10 +45,10 @@
 	"sideEffects": false,
 	"dependencies": {},
 	"peerDependencies": {
-		"rescript": "^12.0.0-beta.12"
+		"rescript": "^12.0.0"
 	},
 	"devDependencies": {
-		"rescript": "^12.0.0-beta.12"
+		"rescript": "^12.3.0"
 	},
 	"publishConfig": {
 		"access": "public"
