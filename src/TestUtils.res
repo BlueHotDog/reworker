@@ -44,8 +44,10 @@ let displayResults = (results: array<testResult>) => {
 
   if passedCount.contents === totalTests {
     Console.log("🎉 All tests passed!")
+    true
   } else {
     Console.error("💥 Some tests failed!")
+    false
   }
 }
 

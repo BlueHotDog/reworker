@@ -12,7 +12,7 @@ type textDecoder
 
 type textEncoder
 @new external makeTextEncoder: unit => textEncoder = "TextEncoder"
-@send external encode: (textEncoder, string) => Js.TypedArray2.Uint8Array.t = "encode"
+@send external encode: (textEncoder, string) => Uint8Array.t = "encode"
 
 let decodeBinary = binary => {
   let decoder = makeTextDecoder()
@@ -20,21 +20,54 @@ let decodeBinary = binary => {
 }
 
 let splitIntoChunks = (string, ~size=defaultChunkSize, ()) => {
+  if size <= 0 {
+    JsError.throwWithMessage("Chunk size must be greater than zero")
+  }
+
   let encoder = makeTextEncoder()
+  let encoded = encoder->encode(string)
   let encodedChunks = []
 
-  let i = ref(0)
-  let length = string->String.length
-  while i.contents < length {
-    let chunk = string->String.slice(~start=i.contents, ~end=i.contents + size)
-    let encodeChunk = encoder->encode(chunk)
-    encodedChunks->Array.push(encodeChunk)->ignore
-    i := i.contents + size
+  let start = ref(0)
+  let length = encoded->TypedArray.length
+  while start.contents < length {
+    let proposedEnd = start.contents + size
+    let endIndex = ref(proposedEnd < length ? proposedEnd : length)
+    let adjustingBoundary = ref(true)
+
+    // Keep each boundary at the start of a UTF-8 code point.
+    while (
+      adjustingBoundary.contents && endIndex.contents < length && endIndex.contents > start.contents
+    ) {
+      let byte = encoded->TypedArray.get(endIndex.contents)->Option.getOr(0)
+      if byte >= 128 && byte < 192 {
+        endIndex := endIndex.contents - 1
+      } else {
+        adjustingBoundary := false
+      }
+    }
+
+    if endIndex.contents === start.contents {
+      endIndex := (proposedEnd < length ? proposedEnd : length)
+      let findingBoundary = ref(true)
+      while findingBoundary.contents && endIndex.contents < length {
+        let byte = encoded->TypedArray.get(endIndex.contents)->Option.getOr(0)
+        if byte >= 128 && byte < 192 {
+          endIndex := endIndex.contents + 1
+        } else {
+          findingBoundary := false
+        }
+      }
+    }
+
+    let chunk = encoded->TypedArray.slice(~start=start.contents, ~end=endIndex.contents)
+    encodedChunks->Array.push(chunk)->ignore
+    start := endIndex.contents
   }
   encodedChunks
 }
 
 let shouldBeChunked = obj => {
   let messageAsString = obj->JSON.stringifyAny->Option.getOrThrow
-  makeTextEncoder()->encode(messageAsString)->Js.TypedArray2.Uint8Array.byteLength > maxSize
+  makeTextEncoder()->encode(messageAsString)->TypedArray.byteLength > maxSize
 }

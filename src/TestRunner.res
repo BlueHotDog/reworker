@@ -22,9 +22,10 @@ let runAllTests = async () => {
     Console.log(`\n🔍 Running ${suiteName}...`)
 
     try {
-      testRunner()
-      passedSuites := passedSuites.contents + 1
-      Console.log(`✅ ${suiteName} completed`)
+      if testRunner() {
+        passedSuites := passedSuites.contents + 1
+        Console.log(`✅ ${suiteName} completed`)
+      }
     } catch {
     | error => Console.error2(`❌ ${suiteName} failed with error:`, error)
     }
@@ -36,9 +37,10 @@ let runAllTests = async () => {
     Console.log(`\n🔍 Running ${suiteName}...`)
 
     try {
-      await testRunner()
-      passedSuites := passedSuites.contents + 1
-      Console.log(`✅ ${suiteName} completed`)
+      if await testRunner() {
+        passedSuites := passedSuites.contents + 1
+        Console.log(`✅ ${suiteName} completed`)
+      }
     } catch {
     | error => Console.error2(`❌ ${suiteName} failed with error:`, error)
     }
@@ -48,11 +50,11 @@ let runAllTests = async () => {
   runSuite("MessageChunker Unit Tests", MessageChunker__test.main)
   runSuite("TransportMessage Unit Tests", TransportMessage__test.main)
   await runAsyncSuite("Response Unit Tests", Response__test.main)
-  runSuite("Runtime Integration Tests", Runtime__test.main)
+  await runAsyncSuite("Runtime Integration Tests", Runtime__test.main)
 
   // Calculate elapsed time
   let endTime = Date.now()
-  let elapsed = endTime -. startTime
+  let elapsed = endTime - startTime
 
   // Print summary
   Console.log("\n" ++ "="->String.repeat(50))
@@ -62,7 +64,7 @@ let runAllTests = async () => {
   let passedCount = passedSuites.contents
   let totalCount = totalSuites.contents
   let passRate = if totalCount > 0 {
-    (passedCount->Int.toFloat /. totalCount->Int.toFloat *. 100.0)->Float.toString
+    (passedCount->Int.toFloat / totalCount->Int.toFloat * 100.0)->Float.toString
   } else {
     "0"
   }
@@ -78,10 +80,10 @@ let runAllTests = async () => {
   } else {
     Console.error("💥 Some test suites failed!")
     Console.log("\n🔧 Please review and fix failing tests before using the library.")
+    JsError.make("Test suite failed")->JsError.throw
   }
 
   Console.log("="->String.repeat(50))
 }
 
-// Export all test runners
-let runAll = runAllTests
+runAllTests()->ignore

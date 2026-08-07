@@ -2,7 +2,8 @@
 	"name": "@bluehotdog/reworker",
 	"sources": {
 		"dir": "src",
-		"subdirs": true
+		"subdirs": true,
+		"public": ["Types", "Runtime", "Response", "Channel", "ChannelTypes", "Id"]
 	},
 	"package-specs": {
 		"module": "esmodule",
@@ -10,5 +11,14 @@
 	},
 	"suffix": ".res.mjs",
 	"dependencies": [],
-	"compiler-flags": ["-w", "+A", "-warn-error", "+A"]
+	"warnings": {
+		"number": "+A",
+		"error": "+A"
+	},
+	"reanalyze": {
+		"analysis": ["dce"],
+		"suppress": [],
+		"unsuppress": [],
+		"transitive": false
+	}
 }

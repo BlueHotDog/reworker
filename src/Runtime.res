@@ -13,8 +13,6 @@ module type RuntimeBindings = {
     let addListener: (('a, sender, 'b => unit) => bool) => unit
     let removeListener: (('a, sender, 'b => unit) => bool) => unit
   }
-
-  // Runtime ID for context validation
   let getRuntimeId: unit => option<string>
 }
 
@@ -35,8 +33,7 @@ module Make = (Bindings: RuntimeBindings) => {
                 finalResp := Some(response)
                 ()
               }
-            | TransportMessage.UserMessage(_) => assert(false)
-            | TransportMessage.IntermediateChunk(_) => assert(false)
+            | TransportMessage.UserMessage(_) | TransportMessage.IntermediateChunk(_) => ()
             }
             (index, chunkTransportMessage, response)
           })

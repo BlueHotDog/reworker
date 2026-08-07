@@ -61,7 +61,7 @@ Simple. Clear.
 
 ## Requirements
 
-- ReScript ^12.0.0-beta.12
+- ReScript ^12.0.0
 - Manifest V3 extensions only
 
 ## License
