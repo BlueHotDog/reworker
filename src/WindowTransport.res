@@ -3,33 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-type browserWindow
-type messagePort
-type messageChannel
-type messageEvent
-
-@new external makeMessageChannel: unit => messageChannel = "MessageChannel"
-@get external firstPort: messageChannel => messagePort = "port1"
-@get external secondPort: messageChannel => messagePort = "port2"
-@send external startPort: messagePort => unit = "start"
-@send external closePort: messagePort => unit = "close"
-@send external postPortMessage: (messagePort, 'a) => unit = "postMessage"
-@send
-external postWindowMessage: (browserWindow, 'a, string, array<messagePort>) => unit = "postMessage"
-@send
-external addWindowEventListener: (browserWindow, string, 'event => unit) => unit =
-  "addEventListener"
-@send
-external removeWindowEventListener: (browserWindow, string, 'event => unit) => unit =
-  "removeEventListener"
-@send
-external addPortEventListener: (messagePort, string, 'event => unit) => unit = "addEventListener"
-@get external eventData: messageEvent => Obj.t = "data"
-@get external eventOrigin: messageEvent => string = "origin"
-@get external eventSource: messageEvent => browserWindow = "source"
-@get external eventPorts: messageEvent => array<messagePort> = "ports"
-@val external currentWindow: browserWindow = "window"
-
 let marker = "@bluehotdog/reworker/window/v1"
 
 type bootstrapMessage = {
@@ -49,7 +22,7 @@ type portMessage = {
 type messageListener = (Obj.t, unit) => unit
 
 type connection = {
-  port: messagePort,
+  port: MessagePort.t,
   id: Id.t,
   mutable ready: bool,
 }
@@ -107,7 +80,7 @@ let disconnect = (endpoint, reason, ~notifyRemote) => {
       endpoint.connection = None
       if notifyRemote {
         try {
-          postPortMessage(
+          MessagePort.postMessage(
             connection.port,
             makePortMessage(~kind="close", ~connectionId=connection.id, ~reason=Some(reason)),
           )
@@ -115,7 +88,7 @@ let disconnect = (endpoint, reason, ~notifyRemote) => {
         | _ => ()
         }
       }
-      closePort(connection.port)
+      MessagePort.close(connection.port)
       notifyClosed(endpoint, reason)
     }
   }
@@ -134,7 +107,7 @@ let activate = (endpoint, port, id, ~ready, ~onReady) => {
 
   let onMessage = event => {
     if isCurrentConnection(endpoint, connection) {
-      switch readPortMessage(eventData(event)) {
+      switch readPortMessage(MessageEvent.data(event)) {
       | Some(message) if message.connectionId === id =>
         switch message.kind {
         | "ready" => onReady()
@@ -163,9 +136,9 @@ let activate = (endpoint, port, id, ~ready, ~onReady) => {
     }
   }
 
-  addPortEventListener(port, "message", onMessage)
-  addPortEventListener(port, "messageerror", onMessageError)
-  startPort(port)
+  MessagePort.addEventListener(port, "message", onMessage)
+  MessagePort.addEventListener(port, "messageerror", onMessageError)
+  MessagePort.start(port)
 }
 
 let markReady = endpoint => {
@@ -179,7 +152,7 @@ let post = (endpoint, message) => {
   switch endpoint.connection {
   | Some(connection) if connection.ready =>
     try {
-      postPortMessage(
+      MessagePort.postMessage(
         connection.port,
         makePortMessage(
           ~kind="data",
@@ -272,8 +245,8 @@ module Parent = {
 
         let targetWindow = Config.targetWindow()
         let id = Id.make()
-        let channel = makeMessageChannel()
-        let port = firstPort(channel)
+        let channel = MessageChannel.make()
+        let port = MessageChannel.port1(channel)
         Promise.make((resolve, reject) => {
           let timeoutId = setTimeout(() => {
             rejectAttempt("Window transport readiness timed out")
@@ -295,11 +268,11 @@ module Parent = {
 
           try {
             let bootstrap = {marker, kind: "connect", connectionId: id}
-            postWindowMessage(
+            BrowserWindow.postMessage(
               Obj.magic(targetWindow),
               bootstrap,
               Config.targetOrigin,
-              [secondPort(channel)],
+              [MessageChannel.port2(channel)],
             )
           } catch {
           | error => {
@@ -370,18 +343,18 @@ module Child = {
     let listening = ref(false)
 
     let onBootstrapMessage = event => {
-      let sourceMatches = eventSource(event) === Obj.magic(Config.parentWindow)
+      let sourceMatches = MessageEvent.source(event) === Obj.magic(Config.parentWindow)
 
-      if eventOrigin(event) === Config.parentOrigin && sourceMatches {
+      if MessageEvent.origin(event) === Config.parentOrigin && sourceMatches {
         try {
-          let bootstrap: bootstrapMessage = Obj.magic(eventData(event))
+          let bootstrap: bootstrapMessage = Obj.magic(MessageEvent.data(event))
           if bootstrap.marker === marker && bootstrap.kind === "connect" {
-            switch eventPorts(event)->Array.get(0) {
+            switch MessageEvent.ports(event)->Array.get(0) {
             | Some(port) => {
                 disconnect(endpoint, "Parent replaced the connection", ~notifyRemote=false)
                 activate(endpoint, port, bootstrap.connectionId, ~ready=true, ~onReady=() => ())
                 try {
-                  postPortMessage(
+                  MessagePort.postMessage(
                     port,
                     makePortMessage(~kind="ready", ~connectionId=bootstrap.connectionId),
                   )
@@ -410,7 +383,7 @@ module Child = {
         Ok()
       } else {
         listening := true
-        addWindowEventListener(currentWindow, "message", onBootstrapMessage)
+        BrowserWindow.addEventListener(BrowserWindow.current, "message", onBootstrapMessage)
         Ok()
       }
     }
@@ -438,7 +411,7 @@ module Child = {
     let close = () => {
       if listening.contents {
         listening := false
-        removeWindowEventListener(currentWindow, "message", onBootstrapMessage)
+        BrowserWindow.removeEventListener(BrowserWindow.current, "message", onBootstrapMessage)
       }
       disconnect(endpoint, "Window transport closed", ~notifyRemote=true)
     }
