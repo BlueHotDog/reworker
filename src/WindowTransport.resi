@@ -16,18 +16,7 @@ module Parent: {
     },
   ) =>
   {
-    type sender = unit
-    let requestTimeoutMs: int
-    let postMessage: 'a => result<unit, string>
-    module OnMessage: {
-      let addListener: (('a, sender) => unit) => unit
-      let removeListener: (('a, sender) => unit) => unit
-    }
-    module OnClose: {
-      let addListener: (string => unit) => unit
-    }
-    let isOpen: unit => bool
-    let close: unit => unit
+    include Runtime.RuntimeBindings with type sender = unit
     let connect: unit => promise<unit>
   }
 }
@@ -42,18 +31,7 @@ module Child: {
     },
   ) =>
   {
-    type sender = unit
-    let requestTimeoutMs: int
-    let postMessage: 'a => result<unit, string>
-    module OnMessage: {
-      let addListener: (('a, sender) => unit) => unit
-      let removeListener: (('a, sender) => unit) => unit
-    }
-    module OnClose: {
-      let addListener: (string => unit) => unit
-    }
-    let isOpen: unit => bool
-    let close: unit => unit
+    include Runtime.RuntimeBindings with type sender = unit
     let listen: unit => result<unit, string>
   }
 }
