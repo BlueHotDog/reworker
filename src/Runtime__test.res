@@ -1,558 +1,247 @@
-@@warning("-4")
 /*
  * Copyright 2025 BlueHotDog
  * SPDX-License-Identifier: MIT
  */
 
-// Integration tests for Runtime module
-// Testing Response.t to callback conversion and Runtime.Make functor
+type messageListener = (Obj.t, unit) => unit
 
-// Mock bindings for testing
-module MockBindings = {
+let leftMessageListeners: ref<array<messageListener>> = ref([])
+let rightMessageListeners: ref<array<messageListener>> = ref([])
+let leftCloseListeners: ref<array<string => unit>> = ref([])
+let rightCloseListeners: ref<array<string => unit>> = ref([])
+let leftOpen = ref(true)
+let rightOpen = ref(true)
+
+let removeListener = (listeners, listener) => {
+  let removed = ref(false)
+  listeners :=
+    listeners.contents->Array.filter(existing => {
+      if !removed.contents && existing === listener {
+        removed := true
+        false
+      } else {
+        true
+      }
+    })
+}
+
+let closeEndpoints = reason => {
+  if leftOpen.contents || rightOpen.contents {
+    leftOpen := false
+    rightOpen := false
+    leftCloseListeners.contents->Array.forEach(listener => listener(reason))
+    rightCloseListeners.contents->Array.forEach(listener => listener(reason))
+  }
+}
+
+module LeftBindings = {
   type sender = unit
+  let requestTimeoutMs = 30
+  let failNextPost = ref(None)
 
-  // Store sent messages count for verification
-  let sentMessageCount = ref(0)
-
-  // Store added listeners count for verification
-  let addedListenerCount = ref(0)
-  let removedListenerCount = ref(0)
-
-  // Store actual handlers for removeListener testing (using Obj.t for type erasure)
-  let storedHandlers: ref<array<Obj.t>> = ref([])
-
-  let sendMessage: 'a => Promise.t<'b> = message => {
-    // Just increment counter instead of storing the actual messages
-    sentMessageCount := sentMessageCount.contents + 1
-    // Ignore the message for now and return a resolved promise
-    ignore(message)
-    Promise.resolve("mock response"->Obj.magic)
+  let postMessage = message => {
+    switch failNextPost.contents {
+    | Some(error) => {
+        failNextPost := None
+        Error(error)
+      }
+    | None if !leftOpen.contents => Error("Endpoint is closed")
+    | None => {
+        rightMessageListeners.contents->Array.forEach(listener => listener(Obj.magic(message), ()))
+        Ok()
+      }
+    }
   }
 
   module OnMessage = {
-    let addListener: (('a, sender, 'b => unit) => bool) => unit = handler => {
-      addedListenerCount := addedListenerCount.contents + 1
-      storedHandlers := Array.concat(storedHandlers.contents, [Obj.magic(handler)])
+    let addListener = listener => {
+      leftMessageListeners := leftMessageListeners.contents->Array.concat([Obj.magic(listener)])
     }
-
-    let removeListener: (('a, sender, 'b => unit) => bool) => unit = handler => {
-      // Check if handler exists in stored handlers
-      let exists = Array.some(storedHandlers.contents, stored =>
-        Obj.magic(stored) === Obj.magic(handler)
-      )
-      if exists {
-        removedListenerCount := removedListenerCount.contents + 1
-        storedHandlers :=
-          Array.filter(storedHandlers.contents, stored => Obj.magic(stored) !== Obj.magic(handler))
-      }
+    let removeListener = listener => {
+      removeListener(leftMessageListeners, Obj.magic(listener))
     }
   }
 
-  let getRuntimeId = () => Some("mock-runtime-id")
-
-  // Helper to reset mock state
-  let reset = () => {
-    sentMessageCount := 0
-    addedListenerCount := 0
-    removedListenerCount := 0
-    storedHandlers := []
+  module OnClose = {
+    let addListener = listener => {
+      leftCloseListeners := leftCloseListeners.contents->Array.concat([listener])
+    }
   }
+
+  let isOpen = () => leftOpen.contents
+  let close = () => closeEndpoints("Endpoint closed")
 }
 
-// Test message types
+module RightBindings = {
+  type sender = unit
+  let requestTimeoutMs = 30
+
+  let postMessage = message => {
+    if rightOpen.contents {
+      leftMessageListeners.contents->Array.forEach(listener => listener(Obj.magic(message), ()))
+      Ok()
+    } else {
+      Error("Endpoint is closed")
+    }
+  }
+
+  module OnMessage = {
+    let addListener = listener => {
+      rightMessageListeners := rightMessageListeners.contents->Array.concat([Obj.magic(listener)])
+    }
+    let removeListener = listener => {
+      removeListener(rightMessageListeners, Obj.magic(listener))
+    }
+  }
+
+  module OnClose = {
+    let addListener = listener => {
+      rightCloseListeners := rightCloseListeners.contents->Array.concat([listener])
+    }
+  }
+
+  let isOpen = () => rightOpen.contents
+  let close = () => closeEndpoints("Endpoint closed")
+}
+
 type Types.message<_> +=
-  | SimpleTest(string): Types.message<string>
-  | AsyncTest(string): Types.message<string>
-  | NoResponseTest: Types.message<unit>
+  | Echo(string): Types.message<string>
+  | AsyncEcho(string): Types.message<string>
+  | FailNow: Types.message<string>
+  | FailLater: Types.message<string>
+  | NeverRespond: Types.message<string>
+  | Notice(string): Types.message<unit>
 
-// Create Runtime instance with mock bindings
-module TestRuntime = Runtime.Make(MockBindings)
+module LeftRuntime = Runtime.Make(LeftBindings)
+module RightRuntime = Runtime.Make(RightBindings)
 
-// Test: sendMessage passes through to bindings
-let testSendMessagePassthrough = async () => {
-  MockBindings.reset()
+let receivedNotices = ref([])
 
-  let testMessage = SimpleTest("send test")
-  try {
-    let response = await TestRuntime.sendMessage(testMessage)
-
-    let sentCount = MockBindings.sentMessageCount.contents
-    if sentCount === 1 && response === "mock response" {
-      Console.log("PASS: sendMessage passed through to bindings")
-      true
-    } else {
-      Console.error(`FAIL: Expected 1 sent message, got ${sentCount->Int.toString}`)
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during sendMessage test:", error)
-    false
-  }
-}
-
-// Test: cast (fire-and-forget) works correctly
-let testCastFireAndForget = () => {
-  MockBindings.reset()
-
-  let testMessage = SimpleTest("cast test")
-
-  try {
-    TestRuntime.cast(testMessage)
-
-    let sentCount = MockBindings.sentMessageCount.contents
-    if sentCount === 1 {
-      Console.log("PASS: cast sends message without expecting response")
-      true
-    } else {
-      Console.error(`FAIL: Expected 1 cast message, got ${sentCount->Int.toString}`)
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during cast test:", error)
-    false
-  }
-}
-
-// Test: addListener converts Response.t to callback pattern
-let testAddListenerConversion = () => {
-  MockBindings.reset()
-
-  let testResponse = "converted response"
-
-  // Create user handler that returns Response.t
-  let userHandler = (message, _sender) => {
+let rightHandler:
+  type response. (Types.message<response>, unit) => Response.t<response> =
+  (message, _sender) => {
     switch message {
-    | SimpleTest(_) => Response.now(testResponse)
-    | AsyncTest(_) => Response.later(Promise.resolve("async response"))
-    | _ => Response.none
-    }
-  }
-
-  try {
-    // Add listener
-    TestRuntime.OnMessage.addListener(userHandler)
-
-    let listenerCount = MockBindings.addedListenerCount.contents
-    if listenerCount === 1 {
-      Console.log("PASS: addListener registered callback with bindings")
-      true
-    } else {
-      Console.error(`FAIL: Expected 1 listener, got ${listenerCount->Int.toString}`)
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during addListener test:", error)
-    false
-  }
-}
-
-// Test: RespondNow conversion to callback (simplified)
-let testRespondNowConversion = () => {
-  MockBindings.reset()
-
-  let testResponse = "immediate response"
-  let userHandler = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now(testResponse)
-    | _ => Response.none
-    }
-  }
-
-  try {
-    TestRuntime.OnMessage.addListener(userHandler)
-    Console.log("PASS: RespondNow handler added without errors")
-    true
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during RespondNow test:", error)
-    false
-  }
-}
-
-// Test: RespondLater conversion to callback with async (simplified)
-let testRespondLaterConversion = () => {
-  MockBindings.reset()
-
-  let asyncResponse = "async response"
-  let userHandler = (message, _sender) => {
-    switch message {
-    | AsyncTest(_) => Response.later(Promise.resolve(asyncResponse))
-    | _ => Response.none
-    }
-  }
-
-  try {
-    TestRuntime.OnMessage.addListener(userHandler)
-    Console.log("PASS: RespondLater handler added without errors")
-    true
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during RespondLater test:", error)
-    false
-  }
-}
-
-// Test: NoResponse conversion to callback (simplified)
-let testNoResponseConversion = () => {
-  MockBindings.reset()
-
-  // Create a separate handler specifically for unit response messages
-  let unitHandler = (message, _sender) => {
-    switch message {
-    | NoResponseTest => Response.none
-    | _ => Response.none
-    }
-  }
-
-  try {
-    TestRuntime.OnMessage.addListener(unitHandler)
-    Console.log("PASS: NoResponse handler added without errors")
-    true
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during NoResponse test:", error)
-    false
-  }
-}
-
-// Test: isContextValid utility
-let testIsContextValid = () => {
-  try {
-    let isValid = TestRuntime.isContextValid()
-
-    if isValid {
-      Console.log("PASS: isContextValid returns true with mock runtime ID")
-      true
-    } else {
-      Console.error("FAIL: isContextValid should return true with mock runtime ID")
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during isContextValid test:", error)
-    false
-  }
-}
-
-// Test: Error handling in user handler (simplified)
-let testErrorHandlingInUserHandler = () => {
-  MockBindings.reset()
-
-  let userHandler = (_message, _sender) => {
-    // Simulate error in user handler
-    JsError.throwWithMessage("Test error in user handler")
-  }
-
-  try {
-    TestRuntime.OnMessage.addListener(userHandler)
-    Console.log("PASS: Error handler added without immediate crash")
-    true
-  } catch {
-  | error =>
-    Console.error2("PASS: Error in user handler was caught during setup", error)
-    true
-  }
-}
-
-// Test: Chunked message handling with out-of-order responses
-let testChunkedMessage = async () => {
-  MockBindings.reset()
-
-  try {
-    let largeMessage = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
-    let testMessage = SimpleTest(largeMessage)
-    let response = await TestRuntime.sendMessage(testMessage)
-
-    if MockBindings.sentMessageCount.contents > 1 && response === "mock response" {
-      Console.log("PASS: Chunked message handled")
-      true
-    } else {
-      Console.error("FAIL: Chunked message did not send all chunks or return the final response")
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during chunked message test:", error)
-    false
-  }
-}
-
-// Test: Basic chunked message handling
-let testBasicChunkedMessage = async () => {
-  MockBindings.reset()
-
-  try {
-    let largeMessage = "B"->String.repeat(MessageChunker.defaultChunkSize + 1000)
-    let testMessage = SimpleTest(largeMessage)
-
-    let response = await TestRuntime.sendMessage(testMessage)
-    if response === "mock response" {
-      Console.log("PASS: Large message handled (basic chunking)")
-      true
-    } else {
-      Console.error("FAIL: Large message returned the wrong response")
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during basic chunked test:", error)
-    false
-  }
-}
-
-// Test: removeListener removes correct handler
-let testRemoveListenerBasic = () => {
-  MockBindings.reset()
-
-  let handler1 = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now("handler1")
-    | _ => Response.none
-    }
-  }
-
-  let handler2 = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now("handler2")
-    | _ => Response.none
-    }
-  }
-
-  try {
-    // Add both handlers
-    TestRuntime.OnMessage.addListener(handler1)
-    TestRuntime.OnMessage.addListener(handler2)
-
-    // Verify both added
-    let addedCount = MockBindings.addedListenerCount.contents
-    if addedCount !== 2 {
-      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
-      false
-    } else {
-      // Remove first handler
-      TestRuntime.OnMessage.removeListener(handler1)
-
-      let removedCount = MockBindings.removedListenerCount.contents
-      if removedCount === 1 {
-        Console.log("PASS: removeListener removed correct handler")
-        true
-      } else {
-        Console.error(`FAIL: Expected 1 removed listener, got ${removedCount->Int.toString}`)
-        false
+    | Echo(value) => Response.now(value)
+    | AsyncEcho(value) => Response.later(Promise.resolve(value))
+    | FailNow => JsError.throwWithMessage("Immediate handler failure")
+    | FailLater =>
+      Response.later(
+        Promise.make((_resolve, reject) => {
+          reject(JsError.make("Deferred handler failure"))
+        }),
+      )
+    | NeverRespond => Response.none
+    | Notice(value) => {
+        receivedNotices := receivedNotices.contents->Array.concat([value])
+        Response.none
       }
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during removeListener basic test:", error)
-    false
-  }
-}
-
-// Test: removeListener with non-existent handler
-let testRemoveListenerNonExistent = () => {
-  MockBindings.reset()
-
-  let handler1 = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now("handler1")
     | _ => Response.none
     }
   }
 
-  let handler2 = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now("handler2")
-    | _ => Response.none
-    }
-  }
+RightRuntime.OnMessage.addListener(rightHandler)
+LeftRuntime.OnMessage.addListener(rightHandler)
 
+@val external errorToString: 'a => string = "String"
+
+let expectRejection = async (promise, expectedMessage) => {
   try {
-    // Add only handler1
-    TestRuntime.OnMessage.addListener(handler1)
-
-    // Try to remove handler2 (never added)
-    TestRuntime.OnMessage.removeListener(handler2)
-
-    let removedCount = MockBindings.removedListenerCount.contents
-    if removedCount === 0 {
-      Console.log("PASS: removeListener ignores non-existent handler")
-      true
-    } else {
-      Console.error(`FAIL: Expected 0 removed listeners, got ${removedCount->Int.toString}`)
-      false
-    }
+    (await promise)->ignore
+    false
   } catch {
   | error =>
-    Console.error2("FAIL: Exception during removeListener non-existent test:", error)
-    false
+    error
+    ->JsExn.fromException
+    ->Option.flatMap(JsExn.message)
+    ->Option.getOr(errorToString(error))
+    ->String.includes(expectedMessage)
   }
 }
 
-// Test: removeListener with same handler added multiple times
-let testRemoveListenerDuplicate = () => {
-  MockBindings.reset()
+let testRoundTrip = async () => {
+  let response = await LeftRuntime.sendMessage(Echo("hello"))
+  response === "hello"
+}
 
+let testAsyncRoundTrip = async () => {
+  let response = await LeftRuntime.sendMessage(AsyncEcho("later"))
+  response === "later"
+}
+
+let testReverseRoundTrip = async () => {
+  let response = await RightRuntime.sendMessage(Echo("reverse"))
+  response === "reverse"
+}
+
+let testCast = () => {
+  LeftRuntime.cast(Notice("received"))
+  receivedNotices.contents->Array.some(value => value === "received")
+}
+
+let testImmediateRemoteError = async () => {
+  await expectRejection(LeftRuntime.sendMessage(FailNow), "Immediate handler failure")
+}
+
+let testDeferredRemoteError = async () => {
+  await expectRejection(LeftRuntime.sendMessage(FailLater), "Deferred handler failure")
+}
+
+let testTimeout = async () => {
+  await expectRejection(LeftRuntime.sendMessage(NeverRespond), "Request timed out")
+}
+
+let testPostFailure = async () => {
+  LeftBindings.failNextPost := Some("Structured clone failed")
+  await expectRejection(LeftRuntime.sendMessage(Echo("uncloneable")), "Structured clone failed")
+}
+
+let testChunkedRoundTrip = async () => {
+  let value = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
+  let response = await LeftRuntime.sendMessage(Echo(value))
+  response === value
+}
+
+let testListenerRemoval = () => {
   let handler = (message, _sender) => {
     switch message {
-    | SimpleTest(_) => Response.now("handler")
+    | Echo(value) => Response.now(value)
     | _ => Response.none
     }
   }
-
-  try {
-    // Add same handler twice
-    TestRuntime.OnMessage.addListener(handler)
-    TestRuntime.OnMessage.addListener(handler)
-
-    let addedCount = MockBindings.addedListenerCount.contents
-    if addedCount !== 2 {
-      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
-      false
-    } else {
-      // Remove handler once
-      TestRuntime.OnMessage.removeListener(handler)
-
-      let removedCount = MockBindings.removedListenerCount.contents
-      let remainingHandlers = Array.length(MockBindings.storedHandlers.contents)
-
-      if removedCount === 1 && remainingHandlers === 1 {
-        Console.log("PASS: removeListener removes one instance of duplicate handler")
-        true
-      } else {
-        Console.error(
-          `FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`,
-        )
-        false
-      }
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during removeListener duplicate test:", error)
-    false
-  }
+  let before = leftMessageListeners.contents->Array.length
+  LeftRuntime.OnMessage.addListener(handler)
+  LeftRuntime.OnMessage.removeListener(handler)
+  leftMessageListeners.contents->Array.length === before
 }
 
-// Test: removeListener with different message types
-let testRemoveListenerDifferentTypes = () => {
-  MockBindings.reset()
+let testContextValidity = () => LeftRuntime.isContextValid()
 
-  let stringHandler = (message, _sender) => {
-    switch message {
-    | SimpleTest(_) => Response.now("string response")
-    | _ => Response.none
-    }
-  }
-
-  let unitHandler = (message, _sender) => {
-    switch message {
-    | NoResponseTest => Response.none
-    | _ => Response.none
-    }
-  }
-
-  try {
-    // Add handlers with different message types
-    TestRuntime.OnMessage.addListener(stringHandler)
-    TestRuntime.OnMessage.addListener(unitHandler)
-
-    let addedCount = MockBindings.addedListenerCount.contents
-    if addedCount !== 2 {
-      Console.error(`FAIL: Expected 2 added listeners, got ${addedCount->Int.toString}`)
-      false
-    } else {
-      // Remove string handler
-      TestRuntime.OnMessage.removeListener(stringHandler)
-
-      let removedCount = MockBindings.removedListenerCount.contents
-      let remainingHandlers = Array.length(MockBindings.storedHandlers.contents)
-
-      if removedCount === 1 && remainingHandlers === 1 {
-        Console.log("PASS: removeListener works with different message types")
-        true
-      } else {
-        Console.error(
-          `FAIL: Expected 1 removed, 1 remaining. Got ${removedCount->Int.toString} removed, ${remainingHandlers->Int.toString} remaining`,
-        )
-        false
-      }
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during removeListener different types test:", error)
-    false
-  }
+let testCloseRejectsPending = async () => {
+  let pending = LeftRuntime.sendMessage(NeverRespond)
+  LeftRuntime.close()
+  let rejected = await expectRejection(pending, "Runtime closed")
+  rejected && !LeftRuntime.isContextValid() && !RightRuntime.isContextValid()
 }
 
-// Test: removeListener memory behavior (WeakMap cleanup)
-let testRemoveListenerMemoryBehavior = () => {
-  MockBindings.reset()
-
-  // Create handler in a scope that will be GC eligible
-  let testHandler = ref(None)
-
-  let createHandler = () => {
-    (message, _sender) => {
-      switch message {
-      | SimpleTest(_) => Response.now("scoped handler")
-      | _ => Response.none
-      }
-    }
-  }
-
-  try {
-    let handler = createHandler()
-    testHandler := Some(handler)
-
-    // Add and then remove handler
-    TestRuntime.OnMessage.addListener(handler)
-    TestRuntime.OnMessage.removeListener(handler)
-
-    let removedCount = MockBindings.removedListenerCount.contents
-    if removedCount === 1 {
-      // Clear reference to make handler eligible for GC
-      testHandler := None
-
-      Console.log("PASS: removeListener completed cleanup (WeakMap should allow GC)")
-      true
-    } else {
-      Console.error(`FAIL: Expected 1 removed listener, got ${removedCount->Int.toString}`)
-      false
-    }
-  } catch {
-  | error =>
-    Console.error2("FAIL: Exception during removeListener memory test:", error)
-    false
-  }
-}
-
-// Run all tests
 let runTests = async () => {
   let syncTests = [
-    ("cast fire-and-forget", testCastFireAndForget),
-    ("addListener conversion", testAddListenerConversion),
-    ("RespondNow conversion", testRespondNowConversion),
-    ("RespondLater conversion", testRespondLaterConversion),
-    ("NoResponse conversion", testNoResponseConversion),
-    ("isContextValid utility", testIsContextValid),
-    ("Error handling in user handler", testErrorHandlingInUserHandler),
-    ("removeListener basic functionality", testRemoveListenerBasic),
-    ("removeListener non-existent handler", testRemoveListenerNonExistent),
-    ("removeListener duplicate handler", testRemoveListenerDuplicate),
-    ("removeListener different message types", testRemoveListenerDifferentTypes),
-    ("removeListener memory behavior", testRemoveListenerMemoryBehavior),
+    ("typed fire-and-forget cast", testCast),
+    ("listener removal", testListenerRemoval),
+    ("context validity", testContextValidity),
   ]
-
   let asyncTests = [
-    ("sendMessage passthrough", testSendMessagePassthrough),
-    ("Chunked message handling", testChunkedMessage),
-    ("Basic chunked message", testBasicChunkedMessage),
+    ("typed request round trip", testRoundTrip),
+    ("reverse request round trip", testReverseRoundTrip),
+    ("deferred response round trip", testAsyncRoundTrip),
+    ("immediate remote error", testImmediateRemoteError),
+    ("deferred remote error", testDeferredRemoteError),
+    ("request timeout", testTimeout),
+    ("structured clone failure", testPostFailure),
+    ("chunked request round trip", testChunkedRoundTrip),
+    ("close rejects pending requests", testCloseRejectsPending),
   ]
 
   await TestUtils.runMixedTests("Runtime Integration Tests", syncTests, asyncTests)
 }
 
-// Export for running
 let main = runTests

@@ -3,88 +3,207 @@
  * SPDX-License-Identifier: MIT
  */
 
-// Generic Runtime wrapper for message passing with automatic chunking
-// Users provide their own messaging bindings (WebWorker, ServiceWorker, WXT, WebExtension-API, etc.)
-
 module type RuntimeBindings = {
   type sender
-  let sendMessage: 'a => Promise.t<'b>
+  let requestTimeoutMs: int
+  let postMessage: 'a => result<unit, string>
   module OnMessage: {
-    let addListener: (('a, sender, 'b => unit) => bool) => unit
-    let removeListener: (('a, sender, 'b => unit) => bool) => unit
+    let addListener: (('a, sender) => unit) => unit
+    let removeListener: (('a, sender) => unit) => unit
   }
-  let getRuntimeId: unit => option<string>
+  module OnClose: {
+    let addListener: (string => unit) => unit
+  }
+  let isOpen: unit => bool
+  let close: unit => unit
+}
+
+type protocolMessage =
+  | Request({id: Id.t, message: Obj.t})
+  | Cast(Obj.t)
+  | Success({id: Id.t, value: Obj.t})
+  | Failure({id: Id.t, message: string})
+
+type pendingRequest = {
+  resolve: Obj.t => unit,
+  reject: JsError.t => unit,
+  timeoutId: timeoutId,
+}
+
+@val external errorToString: 'a => string = "String"
+
+let exceptionMessage = error => {
+  error->JsExn.fromException->Option.flatMap(JsExn.message)->Option.getOr(errorToString(error))
 }
 
 module Make = (Bindings: RuntimeBindings) => {
-  // Type-safe handler mapping for removeListener functionality
+  let pendingRequests: Map.t<Id.t, pendingRequest> = Map.make()
   let handlerToWrapped: HandlerMap.t = HandlerMap.make()
+
+  let sendProtocolMessage = message => {
+    switch Bindings.postMessage(message) {
+    | Ok() => ()
+    | Error(message) => JsError.throwWithMessage(message)
+    }
+  }
+
+  let rejectPendingRequest = (id, message) => {
+    switch pendingRequests->Map.get(id) {
+    | Some(pending) => {
+        clearTimeout(pending.timeoutId)
+        pendingRequests->Map.delete(id)->ignore
+        pending.reject(JsError.make(message))
+      }
+    | None => ()
+    }
+  }
+
+  let responseHandler = (message, _sender) => {
+    switch (Obj.magic(message): protocolMessage) {
+    | Success({id, value}) =>
+      switch pendingRequests->Map.get(id) {
+      | Some(pending) => {
+          clearTimeout(pending.timeoutId)
+          pendingRequests->Map.delete(id)->ignore
+          pending.resolve(value)
+        }
+      | None => ()
+      }
+    | Failure({id, message}) => rejectPendingRequest(id, message)
+    | Request(_) | Cast(_) => ()
+    }
+  }
+
+  let closeHandler = reason => {
+    pendingRequests->Map.forEach(pending => {
+      clearTimeout(pending.timeoutId)
+      pending.reject(JsError.make(reason))
+    })
+    pendingRequests->Map.clear
+  }
+
+  Bindings.OnMessage.addListener(responseHandler)
+  Bindings.OnClose.addListener(closeHandler)
+
+  let sendRequest = (message: TransportMessage.t<'response>): Promise.t<'response> => {
+    let id = Id.make()
+    Promise.make((resolve, reject) => {
+      let timeoutId = setTimeout(() => {
+        rejectPendingRequest(id, "Request timed out")
+      }, Bindings.requestTimeoutMs)
+      pendingRequests->Map.set(
+        id,
+        {
+          resolve: value => resolve(Obj.magic(value)),
+          reject,
+          timeoutId,
+        },
+      )
+
+      try {
+        sendProtocolMessage(Request({id, message: Obj.magic(message)}))
+      } catch {
+      | error => rejectPendingRequest(id, exceptionMessage(error))
+      }
+    })
+  }
+
+  let rec sendChunks = async (chunks: array<Obj.t>, index): Obj.t => {
+    switch chunks->Array.get(index) {
+    | None => JsError.throwWithMessage("Chunked message did not contain a final chunk")
+    | Some(chunk) =>
+      if index === chunks->Array.length - 1 {
+        (await sendRequest(Obj.magic(chunk)))->Obj.magic
+      } else {
+        (await sendRequest(Obj.magic(chunk)))->ignore
+        await sendChunks(chunks, index + 1)
+      }
+    }
+  }
 
   let sendMessage:
     type a. Types.message<a> => Promise.t<a> =
     message => {
       if message->MessageChunker.shouldBeChunked {
-        let finalResp = ref(None)
-        TransportMessage.createChunks(message)
-        ->Array.mapWithIndex((chunkTransportMessage, index) => {
-          Bindings.sendMessage(chunkTransportMessage)->Promise.thenResolve(response => {
-            switch chunkTransportMessage {
-            | TransportMessage.FinalChunk(_chunk) => {
-                finalResp := Some(response)
-                ()
-              }
-            | TransportMessage.UserMessage(_) | TransportMessage.IntermediateChunk(_) => ()
-            }
-            (index, chunkTransportMessage, response)
-          })
-        })
-        ->Promise.all(_)
-        ->Promise.thenResolve(_results => finalResp.contents->Option.getOrThrow)
+        sendChunks(Obj.magic(TransportMessage.createChunks(message)), 0)->Promise.thenResolve(
+          Obj.magic,
+        )
       } else {
-        let transportMessage = TransportMessage.UserMessage(message)
-        Bindings.sendMessage(transportMessage)
+        sendRequest(TransportMessage.UserMessage(message))
       }
     }
 
-  // Fire-and-forget message sending (no response expected)
+  let castTransportMessage = message => {
+    try {
+      sendProtocolMessage(Cast(Obj.magic(message)))
+    } catch {
+    | error => Console.error2("Failed to cast message:", error)
+    }
+  }
+
   let cast:
     type a. Types.message<a> => unit =
     message => {
-      sendMessage(message)->Promise.ignore
+      if message->MessageChunker.shouldBeChunked {
+        TransportMessage.createChunks(message)->Array.forEach(castTransportMessage)
+      } else {
+        castTransportMessage(TransportMessage.UserMessage(message))
+      }
     }
 
-  // Message subscription with automatic chunk reassembly
   module OnMessage = {
     let addListener:
       type a. ((Types.message<a>, Bindings.sender) => Response.t<a>) => unit =
-      userResponseHandler => {
-        let messageHandler = (transportMessage, sender, sendResponse) => {
-          let response = RequestHandler.make(
-            ~userHandler=userResponseHandler,
-            transportMessage,
-            sender,
-          )
+      userHandler => {
+        let messageHandler = (protocolMessage, sender) => {
+          let handleTransportMessage = transportMessage => {
+            RequestHandler.make(~userHandler, transportMessage, sender)
+          }
 
-          // Convert Response.t to Chrome callback pattern
-          switch response {
-          | Response.RespondNow(value) =>
-            sendResponse(value)
-            false // Synchronous response
-          | Response.RespondLater(promise) =>
-            promise
-            ->Promise.then(value => {
-              sendResponse(value)
-              Promise.resolve()
-            })
-            ->ignore
-            true // Asynchronous response
-          | Response.NoResponse => false // No response
+          switch (Obj.magic(protocolMessage): protocolMessage) {
+          | Request({id, message}) =>
+            try {
+              switch handleTransportMessage(Obj.magic(message)) {
+              | Response.RespondNow(value) =>
+                sendProtocolMessage(Success({id, value: Obj.magic(value)}))
+              | Response.RespondLater(promise) =>
+                promise
+                ->Promise.thenResolve(value => {
+                  sendProtocolMessage(Success({id, value: Obj.magic(value)}))
+                })
+                ->Promise.catch(error => {
+                  sendProtocolMessage(
+                    (Failure({id, message: exceptionMessage(error)}): protocolMessage),
+                  )
+                  Promise.resolve()
+                })
+                ->ignore
+              | Response.NoResponse => ()
+              }
+            } catch {
+            | error =>
+              sendProtocolMessage(
+                (Failure({id, message: exceptionMessage(error)}): protocolMessage),
+              )
+            }
+          | Cast(message) =>
+            try {
+              switch handleTransportMessage(Obj.magic(message)) {
+              | Response.RespondLater(promise) =>
+                promise
+                ->Promise.thenResolve(_ => ())
+                ->Promise.catch(_ => Promise.resolve())
+                ->ignore
+              | Response.RespondNow(_) | Response.NoResponse => ()
+              }
+            } catch {
+            | _ => ()
+            }
+          | Success(_) | Failure(_) => ()
           }
         }
 
-        // Store mapping for later removal
-        HandlerMap.set(handlerToWrapped, userResponseHandler, messageHandler)
-
+        HandlerMap.set(handlerToWrapped, userHandler, messageHandler)
         Bindings.OnMessage.addListener(messageHandler)
       }
 
@@ -101,11 +220,9 @@ module Make = (Bindings: RuntimeBindings) => {
       }
   }
 
-  // Utility function to check if extension context is still valid
-  let isContextValid = () => {
-    switch Bindings.getRuntimeId() {
-    | Some(_) => true
-    | None => false // Context invalidated (extension reload/upgrade)
-    }
+  let isContextValid = Bindings.isOpen
+  let close = () => {
+    closeHandler("Runtime closed")
+    Bindings.close()
   }
 }

@@ -3,7 +3,15 @@
 	"sources": {
 		"dir": "src",
 		"subdirs": true,
-		"public": ["Types", "Runtime", "Response", "Channel", "ChannelTypes", "Id"]
+		"public": [
+			"Types",
+			"Runtime",
+			"Response",
+			"Channel",
+			"ChannelTypes",
+			"Id",
+			"WindowTransport"
+		]
 	},
 	"package-specs": {
 		"module": "esmodule",

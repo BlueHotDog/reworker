@@ -43,6 +43,69 @@ let handler = (msg, _sender) => {
 }
 Runtime.OnMessage.addListener(handler)
 ```
+
+Bindings passed to `Runtime.Make` provide an ordered duplex transport. Reworker owns request correlation, timeouts, remote errors, casts, and chunking:
+
+```rescript
+module type MyBindings = {
+  type sender
+  let requestTimeoutMs: int
+  let postMessage: 'a => result<unit, string>
+  module OnMessage: {
+    let addListener: (('a, sender) => unit) => unit
+    let removeListener: (('a, sender) => unit) => unit
+  }
+  module OnClose: {
+    let addListener: (string => unit) => unit
+  }
+  let isOpen: unit => bool
+  let close: unit => unit
+}
+```
+
+`postMessage` must return `Error` when structured clone fails. `OnClose` must fire when the remote endpoint becomes unavailable so pending requests reject immediately.
+
+## Cross-Origin Iframes
+
+`WindowTransport` bootstraps a cross-origin iframe with `window.postMessage`, validates the exact origin and source window, and transfers a `MessagePort`. All Reworker messages then use that port.
+
+Create the parent binding with the iframe's non-null `contentWindow` and an explicit origin:
+
+```rescript
+module FrameBindings = WindowTransport.Parent.Make({
+  type targetWindow = Webapi.Dom.Window.t
+  type loadEvent = Webapi.Dom.Event.t
+  let targetOrigin = "https://frame.example.com"
+  let targetWindow = () => iframe->contentWindow
+  let addLoadListener = listener => iframe->addEventListener("load", listener)
+  let removeLoadListener = listener => iframe->removeEventListener("load", listener)
+  let requestTimeoutMs = 5000
+})
+
+module FrameRuntime = Runtime.Make(FrameBindings)
+
+await FrameBindings.connect()
+let title = await FrameRuntime.sendMessage(GetPageTitle)
+```
+
+Install the cooperating endpoint in the iframe before the parent connects:
+
+```rescript
+module ParentBindings = WindowTransport.Child.Make({
+  type parentWindow = Webapi.Dom.Window.t
+  let parentWindow = Webapi.Dom.window->Webapi.Dom.Window.parent
+  let parentOrigin = "https://parent.example.com"
+  let requestTimeoutMs = 5000
+})
+
+module ParentRuntime = Runtime.Make(ParentBindings)
+
+ParentRuntime.OnMessage.addListener(handler)
+ParentBindings.listen()->Result.getOrThrow
+```
+
+Both origins are mandatory and `"*"` is rejected. The parent binding reconnects with a new port after iframe navigation. Call `Runtime.close()` to reject pending requests and tear down the endpoint.
+
 Build a nice wrapper:
 In your background.res:
 ```rescript

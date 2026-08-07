@@ -4,7 +4,7 @@
 # Run 'make help' to see available commands
 
 .DEFAULT_GOAL := help
-.PHONY: help install build clean dev test analyze lint format check publish setup-hooks
+.PHONY: help install build clean dev test test-browser analyze lint format check publish setup-hooks
 
 # Colors for output
 CYAN := \033[36m
@@ -39,6 +39,11 @@ test: build ## Run all tests
 	@printf "$(YELLOW)Running tests...$(RESET)\n"
 	node src/TestRunner.res.mjs
 	@printf "$(GREEN)Tests complete!$(RESET)\n"
+
+test-browser: build ## Run cross-origin browser tests
+	@printf "$(YELLOW)Running browser tests...$(RESET)\n"
+	node browser-tests/run.mjs
+	@printf "$(GREEN)Browser tests complete!$(RESET)\n"
 
 analyze: build ## Run ReScript dead code analysis
 	@printf "$(YELLOW)Analyzing ReScript code...$(RESET)\n"
