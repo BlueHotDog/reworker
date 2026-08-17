@@ -3,48 +3,39 @@
  * SPDX-License-Identifier: MIT
  */
 
-type transport<'sender, 'extension> = {
+type session<'sender> = {
+  opened: unit => unit,
+  message: (Obj.t, 'sender) => unit,
+  disconnected: string => unit,
+}
+
+type transport<'sender>
+type limits = {
   requestTimeoutMs: int,
   maxMessageBytes: int,
   maxPendingRequests: int,
-  maxChunkBytes: int,
-  postMessage: Obj.t => result<unit, string>,
-  addMessageListener: ((Obj.t, 'sender) => unit) => unit,
-  removeMessageListener: ((Obj.t, 'sender) => unit) => unit,
-  addOpenListener: (unit => unit) => unit,
-  removeOpenListener: (unit => unit) => unit,
-  addCloseListener: (string => unit) => unit,
-  removeCloseListener: (string => unit) => unit,
-  isOpen: unit => bool,
-  isCurrentSender: 'sender => bool,
-  senderKey: 'sender => string,
-  close: unit => unit,
-  extension: 'extension,
 }
-
+type context = Request(AbortSignal.t) | Cast
+type status = Connecting | Open | Disconnected(string) | Closed(string)
 type t<'sender>
 
-let make: transport<'sender, 'extension> => t<'sender>
+let makeTransport: (
+  ~postMessage: Obj.t => result<unit, string>,
+  ~start: (~beginSession: unit => session<'sender>) => unit => unit,
+  ~maxChunkBytes: int,
+) => transport<'sender>
+
+let make: (
+  transport<'sender>,
+  ~limits: limits,
+  ~handler: (Types.message<'response>, 'sender, context) => Response.t<'response>,
+) => t<'sender>
 let sendMessage: (
   t<'sender>,
   Types.message<'response>,
   ~signal: AbortSignal.t=?,
 ) => Promise.t<'response>
-let cast: (t<'sender>, Types.message<'response>) => unit
-
-module OnMessage: {
-  let addListener: (
-    t<'sender>,
-    (Types.message<'response>, 'sender, option<AbortSignal.t>) => Response.t<'response>,
-  ) => unit
-  let removeListener: (
-    t<'sender>,
-    (Types.message<'response>, 'sender, option<AbortSignal.t>) => Response.t<'response>,
-  ) => unit
-}
-
-let isContextValid: t<'sender> => bool
-let onOpen: (t<'sender>, unit => unit) => unit => unit
-let onClose: (t<'sender>, string => unit) => unit => unit
-let onReconnect: (t<'sender>, unit => unit) => unit => unit
+let cast: (t<'sender>, Types.message<unit>) => unit
+let status: t<'sender> => status
+let onStatus: (t<'sender>, status => unit) => unit => unit
 let close: t<'sender> => unit

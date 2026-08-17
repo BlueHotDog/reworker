@@ -6,6 +6,7 @@
 type browserWindow
 type document
 type element
+type event
 
 @val external currentWindow: browserWindow = "window"
 @val external currentDocument: document = "document"
@@ -13,14 +14,24 @@ type element
 @get external contentWindow: element => browserWindow = "contentWindow"
 @send external addEventListener: (element, string, unit => unit) => unit = "addEventListener"
 @send external removeEventListener: (element, string, unit => unit) => unit = "removeEventListener"
+@send external dispatchEvent: (element, event) => unit = "dispatchEvent"
+@new external makeEvent: string => event = "Event"
+@val external globalObject: Dict.t<Obj.t> = "globalThis"
+@val external portListenerRemoves: int = "portListenerRemoves"
 
 open WindowTransportBrowserMessages__test
+
+let limits = {
+  Runtime.requestTimeoutMs: 500,
+  maxMessageBytes: 2_000_000,
+  maxPendingRequests: 100,
+}
 
 let childOpenNotices = ref(0)
 
 let handler:
-  type response. (Types.message<response>, int, option<AbortSignal.t>) => Response.t<response> =
-  (message, _sender, _signal) => {
+  type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+  (message, _sender, _context) => {
     switch message {
     | Reverse(value) => Response.now(`parent:${value}`)
     | DelayedReverse(value) =>
@@ -37,63 +48,161 @@ let handler:
     }
   }
 
-let makeTransport = (iframe, targetOrigin, ~onAdd=() => (), ~onRemove=() => ()) => {
+let makeTransport = (
+  iframe,
+  targetOrigin,
+  channel,
+  ~timeout=500,
+  ~onAdd=() => (),
+  ~onRemove=() => (),
+) =>
   WindowTransport.Parent.make({
     targetOrigin,
     targetWindow: iframe->contentWindow,
-    isTargetLoaded: () => true,
-    addLoadListener: listener => {
+    channel,
+    subscribeLoad: listener => {
       onAdd()
       addEventListener(iframe, "load", listener)
+      () => {
+        onRemove()
+        removeEventListener(iframe, "load", listener)
+      }
     },
-    removeLoadListener: listener => {
-      onRemove()
-      removeEventListener(iframe, "load", listener)
-    },
-    requestTimeoutMs: 500,
-    maxMessageBytes: 2_000_000,
-    maxPendingRequests: 100,
+    connectionTimeoutMs: timeout,
     maxChunkBytes: 100_000,
   })
+
+let makeRuntime = (iframe, channel, ~timeout=500) =>
+  Runtime.make(makeTransport(iframe, "http://127.0.0.1:4174", channel, ~timeout), ~limits, ~handler)
+
+let testSubscribeFailureCleansCallbackConnection = iframe => {
+  let removalsBefore = portListenerRemoves
+  let rolledBackSubscription = ref(false)
+  let didThrow = ref(false)
+  try {
+    Runtime.make(
+      WindowTransport.Parent.make({
+        targetWindow: iframe->contentWindow,
+        targetOrigin: "http://127.0.0.1:4174",
+        channel: "subscribe-failure",
+        subscribeLoad: onLoad => {
+          onLoad()
+          // A throwing subscriber must undo registration because no disposer can be returned.
+          rolledBackSubscription := true
+          JsError.throwWithMessage("subscribe failed")
+        },
+        connectionTimeoutMs: 500,
+        maxChunkBytes: 100_000,
+      }),
+      ~limits,
+      ~handler,
+    )->ignore
+  } catch {
+  | _ => didThrow := true
+  }
+  if (
+    !didThrow.contents ||
+    !rolledBackSubscription.contents ||
+    portListenerRemoves - removalsBefore !== 2
+  ) {
+    JsError.throwWithMessage("subscribe failure did not roll back parent startup")
+  }
 }
 
-let makeConnection = iframe => {
-  let transport = makeTransport(iframe, "http://127.0.0.1:4174")
-  let runtime = Runtime.make(transport)
-  Runtime.OnMessage.addListener(runtime, handler)
-  (transport, runtime)
+let testInitialStartFailureRemovesLoadSubscription = iframe => {
+  let originalMessageChannel = globalObject->Dict.get("MessageChannel")
+  let removeCount = ref(0)
+  let didThrow = ref(false)
+  globalObject->Dict.set("MessageChannel", Obj.magic(undefined))
+  try {
+    Runtime.make(
+      WindowTransport.Parent.make({
+        targetWindow: iframe->contentWindow,
+        targetOrigin: "http://127.0.0.1:4174",
+        channel: "initial-start-failure",
+        subscribeLoad: _onLoad => () => removeCount := removeCount.contents + 1,
+        connectionTimeoutMs: 500,
+        maxChunkBytes: 100_000,
+      }),
+      ~limits,
+      ~handler,
+    )->ignore
+  } catch {
+  | _ => didThrow := true
+  }
+  originalMessageChannel->Option.forEach(value => globalObject->Dict.set("MessageChannel", value))
+  if !didThrow.contents || removeCount.contents !== 1 {
+    JsError.throwWithMessage("initial start failure did not remove load subscription")
+  }
 }
 
 let firstIframe = currentDocument->getElementById("child-a")->Nullable.toOption->Option.getOrThrow
 let secondIframe = currentDocument->getElementById("child-b")->Nullable.toOption->Option.getOrThrow
+let reentrantIframe =
+  currentDocument->getElementById("child-c")->Nullable.toOption->Option.getOrThrow
+let staleIframe = currentDocument->getElementById("child-d")->Nullable.toOption->Option.getOrThrow
+testSubscribeFailureCleansCallbackConnection(firstIframe)
+testInitialStartFailureRemovesLoadSubscription(firstIframe)
 let firstLoadAdds = ref(0)
 let firstLoadRemoves = ref(0)
-let firstTransport = makeTransport(
-  firstIframe,
-  "http://127.0.0.1:4174",
-  ~onAdd=() => firstLoadAdds := firstLoadAdds.contents + 1,
-  ~onRemove=() => firstLoadRemoves := firstLoadRemoves.contents + 1,
+let firstRuntime = Runtime.make(
+  makeTransport(
+    firstIframe,
+    "http://127.0.0.1:4174",
+    "main",
+    ~onAdd=() => firstLoadAdds := firstLoadAdds.contents + 1,
+    ~onRemove=() => firstLoadRemoves := firstLoadRemoves.contents + 1,
+  ),
+  ~limits,
+  ~handler,
 )
-let firstRuntime = Runtime.make(firstTransport)
-Runtime.OnMessage.addListener(firstRuntime, handler)
+let secondRuntime = makeRuntime(secondIframe, "main")
+let isolatedRuntime = makeRuntime(firstIframe, "secondary")
+let reentrantRuntime = makeRuntime(reentrantIframe, "reentrant")
+let staleRuntime = makeRuntime(staleIframe, "stale", ~timeout=100)
+
 let openCount = ref(0)
-let closeCount = ref(0)
-let reconnectCount = ref(0)
-Runtime.onOpen(firstRuntime, () => openCount := openCount.contents + 1)->ignore
-Runtime.onClose(firstRuntime, _reason => closeCount := closeCount.contents + 1)->ignore
-Runtime.onReconnect(firstRuntime, () => reconnectCount := reconnectCount.contents + 1)->ignore
-let (secondTransport, secondRuntime) = makeConnection(secondIframe)
+let disconnectedCount = ref(0)
+let closedCount = ref(0)
+Runtime.onStatus(firstRuntime, status => {
+  switch status {
+  | Runtime.Open => openCount := openCount.contents + 1
+  | Runtime.Disconnected(_) => disconnectedCount := disconnectedCount.contents + 1
+  | Runtime.Closed(_) => closedCount := closedCount.contents + 1
+  | Runtime.Connecting => ()
+  }
+})->ignore
+
+let closeOnDisconnect = ref(false)
+Runtime.onStatus(reentrantRuntime, status => {
+  switch status {
+  | Runtime.Disconnected(_) if closeOnDisconnect.contents => Runtime.close(reentrantRuntime)
+  | Runtime.Connecting | Runtime.Open | Runtime.Disconnected(_) | Runtime.Closed(_) => ()
+  }
+})->ignore
+
+// Simulates a load racing initial bootstrap. Real iframe load may replace this attempt again.
+staleIframe->dispatchEvent(makeEvent("load"))
+
+let isOpen = runtime => {
+  switch Runtime.status(runtime) {
+  | Runtime.Open => true
+  | Runtime.Connecting | Runtime.Disconnected(_) | Runtime.Closed(_) => false
+  }
+}
 
 let api: Dict.t<Obj.t> = Dict.make()
+api->Dict.set("isOpen", Obj.magic(() => isOpen(firstRuntime)))
 api->Dict.set(
-  "connect",
-  Obj.magic(async () => {
-    let first = WindowTransport.Parent.connect(firstTransport)
-    let second = WindowTransport.Parent.connect(secondTransport)
-    await first
-    await second
-  }),
+  "allOpen",
+  Obj.magic(() =>
+    isOpen(firstRuntime) &&
+    isOpen(secondRuntime) &&
+    isOpen(isolatedRuntime) &&
+    isOpen(reentrantRuntime)
+  ),
 )
+api->Dict.set("staleOpen", Obj.magic(() => isOpen(staleRuntime)))
 api->Dict.set("ping", Obj.magic(value => Runtime.sendMessage(firstRuntime, Ping(value))))
 api->Dict.set(
   "pingFrame",
@@ -101,6 +210,8 @@ api->Dict.set(
     Runtime.sendMessage(index === 0 ? firstRuntime : secondRuntime, Ping(value))
   ),
 )
+api->Dict.set("pingIsolated", Obj.magic(value => Runtime.sendMessage(isolatedRuntime, Ping(value))))
+api->Dict.set("pingStale", Obj.magic(value => Runtime.sendMessage(staleRuntime, Ping(value))))
 api->Dict.set("reverse", Obj.magic(value => Runtime.sendMessage(firstRuntime, AskReverse(value))))
 api->Dict.set("cast", Obj.magic(value => Runtime.cast(firstRuntime, Notice(value))))
 api->Dict.set("notice", Obj.magic(() => Runtime.sendMessage(firstRuntime, GetNotice)))
@@ -156,22 +267,41 @@ api->Dict.set(
   "oversized",
   Obj.magic(() => Runtime.sendMessage(firstRuntime, Ping("x"->String.repeat(2_000_000)))),
 )
-api->Dict.set("close", Obj.magic(() => Runtime.close(firstRuntime)))
-api->Dict.set("isOpen", Obj.magic(() => Runtime.isContextValid(firstRuntime)))
+api->Dict.set(
+  "close",
+  Obj.magic(() => {
+    Runtime.close(firstRuntime)
+    Runtime.close(firstRuntime)
+  }),
+)
 api->Dict.set(
   "lifecycleCounts",
-  Obj.magic(() => [openCount.contents, closeCount.contents, reconnectCount.contents]),
+  Obj.magic(() => [openCount.contents, disconnectedCount.contents, closedCount.contents]),
 )
-api->Dict.set("reconnectFirst", Obj.magic(() => WindowTransport.Parent.connect(firstTransport)))
+api->Dict.set(
+  "closeDuringReplacement",
+  Obj.magic(() => {
+    closeOnDisconnect := true
+    reentrantIframe->dispatchEvent(makeEvent("load"))
+    switch Runtime.status(reentrantRuntime) {
+    | Runtime.Closed(_) => true
+    | Runtime.Connecting | Runtime.Open | Runtime.Disconnected(_) => false
+    }
+  }),
+)
 api->Dict.set(
   "firstLoadListenersRemoved",
   Obj.magic(() =>
-    firstLoadAdds.contents > 0 && firstLoadAdds.contents === firstLoadRemoves.contents
+    firstLoadAdds.contents === 1 && firstLoadAdds.contents === firstLoadRemoves.contents
   ),
 )
 api->Dict.set(
   "invalidOrigin",
-  Obj.magic(origin => WindowTransport.Parent.connect(makeTransport(firstIframe, origin))),
+  Obj.magic(origin => makeTransport(firstIframe, origin, "invalid")->ignore),
+)
+api->Dict.set(
+  "invalidChannel",
+  Obj.magic(() => makeTransport(firstIframe, "http://127.0.0.1:4174", "")->ignore),
 )
 
 (Obj.magic(currentWindow): Dict.t<Obj.t>)->Dict.set("reworkerTest", api->Obj.magic)

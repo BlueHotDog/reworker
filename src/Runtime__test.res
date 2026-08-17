@@ -3,1278 +3,862 @@
  * SPDX-License-Identifier: MIT
  */
 
-type messageListener = (Obj.t, unit) => unit
-
-@new external makeArrayBuffer: int => Obj.t = "ArrayBuffer"
-@val external objectConstructorValue: Obj.t = "Object"
-@val external objectPrototypeValue: Obj.t = "Object.prototype"
-@val external nullValue: Obj.t = "null"
-@scope("Object") @val external setPrototypeOf: (Obj.t, Obj.t) => Obj.t = "setPrototypeOf"
-
-let leftMessageListeners: ref<array<messageListener>> = ref([])
-let rightMessageListeners: ref<array<messageListener>> = ref([])
-let leftCloseListeners: ref<array<string => unit>> = ref([])
-let rightCloseListeners: ref<array<string => unit>> = ref([])
-let leftOpen = ref(true)
-let rightOpen = ref(true)
-
-let removeListener = (listeners, listener) => {
-  let removed = ref(false)
-  listeners :=
-    listeners.contents->Array.filter(existing => {
-      if !removed.contents && existing === listener {
-        removed := true
-        false
-      } else {
-        true
-      }
-    })
-}
-
-type testEndpoint = {
-  messageListeners: ref<array<messageListener>>,
-  openListeners: ref<array<unit => unit>>,
-  closeListeners: ref<array<string => unit>>,
-  isOpen: ref<bool>,
-  isCurrentSender: ref<bool>,
-  postCount: ref<int>,
-  lastPosted: ref<option<Obj.t>>,
-  afterPost: ref<unit => unit>,
-}
-
-type transportPair = {
-  left: Runtime.transport<unit, unit>,
-  right: Runtime.transport<unit, unit>,
-  leftEndpoint: testEndpoint,
-  rightEndpoint: testEndpoint,
-  openEndpoints: unit => unit,
-  closeEndpoints: string => unit,
-}
-
-let makeTransportPair = (
-  ~initiallyOpen=true,
-  ~maxMessageBytes=32_000_000,
-  ~maxPendingRequests=100,
-  ~receiverMaxPendingRequests=maxPendingRequests,
-  ~maxChunkBytes=1_000_000,
-) => {
-  let leftEndpoint = {
-    messageListeners: ref([]),
-    openListeners: ref([]),
-    closeListeners: ref([]),
-    isOpen: ref(initiallyOpen),
-    isCurrentSender: ref(true),
-    postCount: ref(0),
-    lastPosted: ref(None),
-    afterPost: ref(() => ()),
-  }
-  let rightEndpoint = {
-    messageListeners: ref([]),
-    openListeners: ref([]),
-    closeListeners: ref([]),
-    isOpen: ref(initiallyOpen),
-    isCurrentSender: ref(true),
-    postCount: ref(0),
-    lastPosted: ref(None),
-    afterPost: ref(() => ()),
-  }
-
-  let openEndpoints = () => {
-    if !leftEndpoint.isOpen.contents || !rightEndpoint.isOpen.contents {
-      leftEndpoint.isOpen := true
-      rightEndpoint.isOpen := true
-      leftEndpoint.openListeners.contents->Array.forEach(listener => listener())
-      rightEndpoint.openListeners.contents->Array.forEach(listener => listener())
-    }
-  }
-
-  let closeEndpoints = reason => {
-    if leftEndpoint.isOpen.contents || rightEndpoint.isOpen.contents {
-      leftEndpoint.isOpen := false
-      rightEndpoint.isOpen := false
-      leftEndpoint.closeListeners.contents->Array.forEach(listener => listener(reason))
-      rightEndpoint.closeListeners.contents->Array.forEach(listener => listener(reason))
-    }
-  }
-
-  let makeTransport = (endpoint, peer, pendingLimit): Runtime.transport<unit, unit> => {
-    requestTimeoutMs: 30,
-    maxMessageBytes,
-    maxPendingRequests: pendingLimit,
-    maxChunkBytes,
-    postMessage: message => {
-      if endpoint.isOpen.contents {
-        endpoint.postCount := endpoint.postCount.contents + 1
-        endpoint.lastPosted := Some(message)
-        peer.messageListeners.contents->Array.forEach(listener => listener(message, ()))
-        endpoint.afterPost.contents()
-        Ok()
-      } else {
-        Error("Endpoint is closed")
-      }
-    },
-    addMessageListener: listener => {
-      endpoint.messageListeners := endpoint.messageListeners.contents->Array.concat([listener])
-    },
-    removeMessageListener: listener => removeListener(endpoint.messageListeners, listener),
-    addOpenListener: listener => {
-      endpoint.openListeners := endpoint.openListeners.contents->Array.concat([listener])
-    },
-    removeOpenListener: listener => removeListener(endpoint.openListeners, listener),
-    addCloseListener: listener => {
-      endpoint.closeListeners := endpoint.closeListeners.contents->Array.concat([listener])
-    },
-    removeCloseListener: listener => removeListener(endpoint.closeListeners, listener),
-    isOpen: () => endpoint.isOpen.contents,
-    isCurrentSender: _ => endpoint.isOpen.contents && endpoint.isCurrentSender.contents,
-    senderKey: _ => "endpoint",
-    close: () => closeEndpoints("Endpoint closed"),
-    extension: (),
-  }
-
-  {
-    left: makeTransport(leftEndpoint, rightEndpoint, maxPendingRequests),
-    right: makeTransport(rightEndpoint, leftEndpoint, receiverMaxPendingRequests),
-    leftEndpoint,
-    rightEndpoint,
-    openEndpoints,
-    closeEndpoints,
-  }
-}
-
-let closeEndpoints = reason => {
-  if leftOpen.contents || rightOpen.contents {
-    leftOpen := false
-    rightOpen := false
-    leftCloseListeners.contents->Array.forEach(listener => listener(reason))
-    rightCloseListeners.contents->Array.forEach(listener => listener(reason))
-  }
-}
-
-module LeftBindings = {
-  type sender = unit
-  let requestTimeoutMs = 30
-  let failNextPost = ref(None)
-
-  let postMessage = message => {
-    switch failNextPost.contents {
-    | Some(error) => {
-        failNextPost := None
-        Error(error)
-      }
-    | None if !leftOpen.contents => Error("Endpoint is closed")
-    | None => {
-        rightMessageListeners.contents->Array.forEach(listener => listener(Obj.magic(message), ()))
-        Ok()
-      }
-    }
-  }
-
-  module OnMessage = {
-    let addListener = listener => {
-      leftMessageListeners := leftMessageListeners.contents->Array.concat([Obj.magic(listener)])
-    }
-    let removeListener = listener => {
-      removeListener(leftMessageListeners, Obj.magic(listener))
-    }
-  }
-
-  module OnClose = {
-    let addListener = listener => {
-      leftCloseListeners := leftCloseListeners.contents->Array.concat([listener])
-    }
-    let removeListener = listener => removeListener(leftCloseListeners, listener)
-  }
-
-  let isOpen = () => leftOpen.contents
-  let close = () => closeEndpoints("Endpoint closed")
-}
-
-module RightBindings = {
-  type sender = unit
-  let requestTimeoutMs = 30
-
-  let postMessage = message => {
-    if rightOpen.contents {
-      leftMessageListeners.contents->Array.forEach(listener => listener(Obj.magic(message), ()))
-      Ok()
-    } else {
-      Error("Endpoint is closed")
-    }
-  }
-
-  module OnMessage = {
-    let addListener = listener => {
-      rightMessageListeners := rightMessageListeners.contents->Array.concat([Obj.magic(listener)])
-    }
-    let removeListener = listener => {
-      removeListener(rightMessageListeners, Obj.magic(listener))
-    }
-  }
-
-  module OnClose = {
-    let addListener = listener => {
-      rightCloseListeners := rightCloseListeners.contents->Array.concat([listener])
-    }
-    let removeListener = listener => removeListener(rightCloseListeners, listener)
-  }
-
-  let isOpen = () => rightOpen.contents
-  let close = () => closeEndpoints("Endpoint closed")
-}
-
 type Types.message<_> +=
   | Echo(string): Types.message<string>
-  | AsyncEcho(string): Types.message<string>
-  | FailNow: Types.message<string>
-  | FailLater: Types.message<string>
-  | NeverRespond: Types.message<string>
-  | Cancellable: Types.message<string>
-  | LargeResponse(int): Types.message<string>
-  | UnitResponse: Types.message<unit>
-  | UncloneableResponse: Types.message<string>
-  | BinaryRequest(Obj.t): Types.message<bool>
-  | BinaryResponse: Types.message<string>
-  | NumberEcho(float): Types.message<float>
   | Notice(string): Types.message<unit>
+  | Never: Types.message<string>
+  | NeverLarge(string): Types.message<string>
+  | Cancellable: Types.message<string>
+  | Fail: Types.message<string>
+  | Ignored: Types.message<string>
+  | ThrowUnstringifiable: Types.message<string>
 
-let leftRuntime = Runtime.make({
-  requestTimeoutMs: LeftBindings.requestTimeoutMs,
-  maxMessageBytes: 32_000_000,
-  maxPendingRequests: 100,
-  maxChunkBytes: 1_000_000,
-  postMessage: message => LeftBindings.postMessage(Obj.magic(message)),
-  addMessageListener: listener => LeftBindings.OnMessage.addListener(Obj.magic(listener)),
-  removeMessageListener: listener => LeftBindings.OnMessage.removeListener(Obj.magic(listener)),
-  addOpenListener: _ => (),
-  removeOpenListener: _ => (),
-  addCloseListener: LeftBindings.OnClose.addListener,
-  removeCloseListener: LeftBindings.OnClose.removeListener,
-  isOpen: LeftBindings.isOpen,
-  isCurrentSender: _ => LeftBindings.isOpen(),
-  senderKey: _ => "left",
-  close: LeftBindings.close,
-  extension: (),
-})
-let rightRuntime = Runtime.make({
-  requestTimeoutMs: RightBindings.requestTimeoutMs,
-  maxMessageBytes: 32_000_000,
-  maxPendingRequests: 100,
-  maxChunkBytes: 1_000_000,
-  postMessage: message => RightBindings.postMessage(Obj.magic(message)),
-  addMessageListener: listener => RightBindings.OnMessage.addListener(Obj.magic(listener)),
-  removeMessageListener: listener => RightBindings.OnMessage.removeListener(Obj.magic(listener)),
-  addOpenListener: _ => (),
-  removeOpenListener: _ => (),
-  addCloseListener: RightBindings.OnClose.addListener,
-  removeCloseListener: RightBindings.OnClose.removeListener,
-  isOpen: RightBindings.isOpen,
-  isCurrentSender: _ => RightBindings.isOpen(),
-  senderKey: _ => "right",
-  close: RightBindings.close,
-  extension: (),
-})
+type endpoint = {
+  beginSession: ref<option<unit => Runtime.session<unit>>>,
+  session: ref<option<Runtime.session<unit>>>,
+  posts: ref<array<Obj.t>>,
+  autoDeliver: ref<bool>,
+  teardownCount: ref<int>,
+  teardownThrows: ref<bool>,
+  failPostAt: ref<option<int>>,
+  mutable deliver: Obj.t => unit,
+}
+
+type pair = {
+  left: Runtime.transport<unit>,
+  right: Runtime.transport<unit>,
+  leftEndpoint: endpoint,
+  rightEndpoint: endpoint,
+}
+
+let makeEndpoint = () => {
+  beginSession: ref(None),
+  session: ref(None),
+  posts: ref([]),
+  autoDeliver: ref(true),
+  teardownCount: ref(0),
+  teardownThrows: ref(false),
+  failPostAt: ref(None),
+  deliver: _ => (),
+}
+
+let beginEndpointSession = endpoint => {
+  let beginSession = endpoint.beginSession.contents->Option.getOrThrow
+  let session = beginSession()
+  endpoint.session := Some(session)
+  session
+}
+
+let currentSession = endpoint => endpoint.session.contents->Option.getOrThrow
+
+let makePair = (~maxChunkBytes=64, ~rightMaxChunkBytes=maxChunkBytes, ~openOnStart=true) => {
+  let leftEndpoint = makeEndpoint()
+  let rightEndpoint = makeEndpoint()
+  leftEndpoint.deliver = payload =>
+    rightEndpoint.session.contents->Option.forEach(session => session.message(payload, ()))
+  rightEndpoint.deliver = payload =>
+    leftEndpoint.session.contents->Option.forEach(session => session.message(payload, ()))
+
+  let makeTransport = (endpoint, maxChunkBytes) =>
+    Runtime.makeTransport(
+      ~maxChunkBytes,
+      ~postMessage=payload => {
+        endpoint.posts := endpoint.posts.contents->Array.concat([payload])
+        if endpoint.failPostAt.contents === Some(endpoint.posts.contents->Array.length) {
+          Error("post failed")
+        } else {
+          if endpoint.autoDeliver.contents {
+            endpoint.deliver(payload)
+          }
+          Ok()
+        }
+      },
+      ~start=(~beginSession) => {
+        endpoint.beginSession := Some(beginSession)
+        let session = beginEndpointSession(endpoint)
+        if openOnStart {
+          session.opened()
+        }
+        let tornDown = ref(false)
+        () => {
+          if !tornDown.contents {
+            tornDown := true
+            endpoint.teardownCount := endpoint.teardownCount.contents + 1
+            endpoint.beginSession := None
+            endpoint.session := None
+            if endpoint.teardownThrows.contents {
+              JsError.throwWithMessage("teardown failed")
+            }
+          }
+        }
+      },
+    )
+
+  {
+    left: makeTransport(leftEndpoint, maxChunkBytes),
+    right: makeTransport(rightEndpoint, rightMaxChunkBytes),
+    leftEndpoint,
+    rightEndpoint,
+  }
+}
+
+let limits = (~timeout=25, ~maxBytes=10_000, ~maxPending=10) => {
+  Runtime.requestTimeoutMs: timeout,
+  maxMessageBytes: maxBytes,
+  maxPendingRequests: maxPending,
+}
 
 let receivedNotices = ref([])
 
-let rightHandler:
-  type response. (Types.message<response>, unit, option<AbortSignal.t>) => Response.t<response> =
-  (message, _sender, _signal) => {
+let handler:
+  type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+  (message, _sender, _context) =>
     switch message {
     | Echo(value) => Response.now(value)
-    | AsyncEcho(value) => Response.later(Promise.resolve(value))
-    | FailNow => JsError.throwWithMessage("Immediate handler failure")
-    | FailLater =>
-      Response.later(
-        Promise.make((_resolve, reject) => {
-          reject(JsError.make("Deferred handler failure"))
-        }),
-      )
-    | NeverRespond => Response.none
-    | Cancellable => Response.none
-    | LargeResponse(size) => Response.now("r"->String.repeat(size))
-    | UnitResponse => Response.now()
-    | UncloneableResponse => Response.now(Obj.magic(() => ()))
-    | BinaryRequest(_) => Response.now(true)
-    | BinaryResponse => Response.now(Obj.magic(makeArrayBuffer(1000)))
-    | NumberEcho(value) => Response.now(value)
     | Notice(value) => {
         receivedNotices := receivedNotices.contents->Array.concat([value])
         Response.none
       }
+    | Never => Response.later(Promise.make((_resolve, _reject) => ()))
+    | NeverLarge(_) => Response.later(Promise.make((_resolve, _reject) => ()))
+    | Cancellable => Response.later(Promise.make((_resolve, _reject) => ()))
+    | Fail => JsError.throwWithMessage("handler failed")
+    | Ignored => Response.none
+    | ThrowUnstringifiable => {
+        let error: Dict.t<Obj.t> = Dict.make()
+        error->Dict.set("valueOf", Obj.magic(() => JsError.throwWithMessage("conversion failed")))
+        error->Dict.set("toString", Obj.magic(() => JsError.throwWithMessage("conversion failed")))
+        JsError.throw(Obj.magic(error))
+      }
     | _ => Response.none
     }
-  }
 
-Runtime.OnMessage.addListener(rightRuntime, rightHandler)
-Runtime.OnMessage.addListener(leftRuntime, rightHandler)
+let inertHandler = (_message, _sender, _context) => Response.none
 
 @val external errorToString: 'a => string = "String"
 
-let expectRejection = async (promise, expectedMessage) => {
+let errorMessage = error =>
+  error->JsExn.fromException->Option.flatMap(JsExn.message)->Option.getOr(errorToString(error))
+
+let rejectsWith = async (promise, expected) => {
   try {
     (await promise)->ignore
     false
   } catch {
-  | error =>
-    error
-    ->JsExn.fromException
-    ->Option.flatMap(JsExn.message)
-    ->Option.getOr(errorToString(error))
-    ->String.includes(expectedMessage)
+  | error => error->errorMessage->String.includes(expected)
   }
 }
 
-let expectThrow = (callback, expectedMessage) => {
+let throwsWith = (callback, expected) => {
   try {
     callback()
     false
   } catch {
-  | error =>
-    error
-    ->JsExn.fromException
-    ->Option.flatMap(JsExn.message)
-    ->Option.getOr(errorToString(error))
-    ->String.includes(expectedMessage)
+  | error => error->errorMessage->String.includes(expected)
   }
 }
 
-let testRoundTrip = async () => {
-  let response = await Runtime.sendMessage(leftRuntime, Echo("hello"))
-  response === "hello"
+let wait = milliseconds =>
+  Promise.make((resolve, _reject) => setTimeout(resolve, milliseconds)->ignore)
+
+let protocol = (tag, fields: array<(string, Obj.t)>) => {
+  let value: Dict.t<Obj.t> = Dict.make()
+  value->Dict.set("TAG", Obj.magic(tag))
+  fields->Array.forEach(((key, field)) => value->Dict.set(key, field))
+  Obj.magic(value)
 }
 
-let testAsyncRoundTrip = async () => {
-  let response = await Runtime.sendMessage(leftRuntime, AsyncEcho("later"))
-  response === "later"
-}
+let field = (payload, key) => (Obj.magic(payload): Dict.t<Obj.t>)->Dict.get(key)->Option.getOrThrow
 
-let testReverseRoundTrip = async () => {
-  let response = await Runtime.sendMessage(rightRuntime, Echo("reverse"))
-  response === "reverse"
-}
-
-let testCast = () => {
-  Runtime.cast(leftRuntime, Notice("received"))
-  receivedNotices.contents->Array.some(value => value === "received")
-}
-
-let testImmediateRemoteError = async () => {
-  await expectRejection(Runtime.sendMessage(leftRuntime, FailNow), "Immediate handler failure")
-}
-
-let testDeferredRemoteError = async () => {
-  await expectRejection(Runtime.sendMessage(leftRuntime, FailLater), "Deferred handler failure")
-}
-
-let testTimeout = async () => {
-  await expectRejection(Runtime.sendMessage(leftRuntime, NeverRespond), "Request timed out")
-}
-
-let testPostFailure = async () => {
-  LeftBindings.failNextPost := Some("Structured clone failed")
-  await expectRejection(
-    Runtime.sendMessage(leftRuntime, Echo("uncloneable")),
-    "Structured clone failed",
-  )
-}
-
-let testChunkedRoundTrip = async () => {
-  let value = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
-  let response = await Runtime.sendMessage(leftRuntime, Echo(value))
-  response === value
-}
-
-let testChunkAssembliesAreSenderScoped = () => {
-  let state = RequestHandler.makeState(
-    ~timeoutMs=100,
-    ~maxMessageBytes=1000,
-    ~maxPendingRequests=10,
-    ~maxChunkBytes=5,
-  )
-  let chunks: array<Obj.t> = Obj.magic(
-    TransportMessage.createChunks(Echo("sender scoped"), ~size=5),
-  )
-  let handler:
-    type response. (Types.message<response>, int, option<AbortSignal.t>) => Response.t<response> =
-    (message, _sender, _signal) => {
-      switch message {
-      | Echo(value) => Response.now(value)
-      | _ => Response.none
-      }
-    }
-  for index in 0 to chunks->Array.length - 2 {
-    let chunk = chunks[index]->Option.getOrThrow
-    RequestHandler.make(state, ~userHandler=handler, Obj.magic(chunk), 1, "sender-1", None)->ignore
-    RequestHandler.make(state, ~userHandler=handler, Obj.magic(chunk), 2, "sender-2", None)->ignore
+let isClosed = state =>
+  switch state {
+  | Runtime.Closed("Runtime closed") => true
+  | Runtime.Connecting | Runtime.Open | Runtime.Disconnected(_) | Runtime.Closed(_) => false
   }
-  let finalChunk = chunks[chunks->Array.length - 1]->Option.getOrThrow
-  let first: Response.t<string> = Obj.magic(
-    RequestHandler.make(state, ~userHandler=handler, Obj.magic(finalChunk), 1, "sender-1", None),
-  )
-  let second: Response.t<string> = Obj.magic(
-    RequestHandler.make(state, ~userHandler=handler, Obj.magic(finalChunk), 2, "sender-2", None),
-  )
-  switch first {
-  | Response.RespondNow(first) =>
-    switch second {
-    | Response.RespondNow(second) => first === "sender scoped" && second === "sender scoped"
-    | Response.RespondLater(_) | Response.NoResponse => false
-    }
-  | Response.RespondLater(_) | Response.NoResponse => false
-  }
+
+let makeRuntimes = (~maxChunkBytes=64, ~leftLimits=limits(), ~rightLimits=limits()) => {
+  let pair = makePair(~maxChunkBytes)
+  let left = Runtime.make(pair.left, ~limits=leftLimits, ~handler)
+  let right = Runtime.make(pair.right, ~limits=rightLimits, ~handler)
+  (pair, left, right)
 }
 
-let testMalformedChunkLimits = () => {
-  let state = RequestHandler.makeState(
-    ~timeoutMs=100,
-    ~maxMessageBytes=20,
-    ~maxPendingRequests=2,
-    ~maxChunkBytes=10,
+let testTransportSingleConsumption = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let rejected = throwsWith(
+    () => Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)->ignore,
+    "already been consumed",
   )
-  let handler = (_message, _sender, _signal) => Response.none
-  let messageId = Id.make()
-  let first = TransportMessage.Chunk.make(~messageId, ~index=0, ~total=2, ~body="1234567890")
-  let final = TransportMessage.Chunk.make(~messageId, ~index=1, ~total=2, ~body="final")
-  RequestHandler.make(
-    state,
-    ~userHandler=handler,
-    TransportMessage.IntermediateChunk(first),
-    (),
-    "sender",
-    None,
-  )->ignore
-  let duplicateRejected = expectThrow(
-    () =>
-      RequestHandler.make(
-        state,
-        ~userHandler=handler,
-        TransportMessage.IntermediateChunk(first),
-        (),
-        "sender",
-        None,
-      )->ignore,
-    "Malformed chunk sequence",
-  )
-  let abandonedAssemblyCleared = expectThrow(
-    () =>
-      RequestHandler.make(
-        state,
-        ~userHandler=handler,
-        TransportMessage.FinalChunk(final),
-        (),
-        "sender",
-        None,
-      )->ignore,
-    "Malformed chunk sequence",
-  )
-  let oversized = TransportMessage.Chunk.make(
-    ~messageId=Id.make(),
-    ~index=0,
-    ~total=1,
-    ~body="x"->String.repeat(11),
-  )
-  let oversizedRejected = expectThrow(
-    () =>
-      RequestHandler.make(
-        state,
-        ~userHandler=handler,
-        TransportMessage.FinalChunk(oversized),
-        (),
-        "sender",
-        None,
-      )->ignore,
-    "maxChunkBytes",
-  )
-  let firstAssemblyId = Id.make()
-  let secondAssemblyId = Id.make()
-  let thirdAssemblyId = Id.make()
-  let addAssembly = messageId =>
-    RequestHandler.make(
-      state,
-      ~userHandler=handler,
-      TransportMessage.IntermediateChunk(
-        TransportMessage.Chunk.make(~messageId, ~index=0, ~total=2, ~body="1234567890"),
-      ),
-      (),
-      "sender",
-      None,
+  Runtime.close(runtime)
+  rejected
+}
+
+let testTransportRejectsUnsafeChunkCap = () => throwsWith(() =>
+    Runtime.makeTransport(
+      ~maxChunkBytes=3,
+      ~postMessage=_ => Ok(),
+      ~start=(~beginSession) => {
+        beginSession->ignore
+        () => ()
+      },
     )->ignore
-  addAssembly(firstAssemblyId)
-  addAssembly(secondAssemblyId)
-  let assemblyLimitRejected = expectThrow(
-    () => addAssembly(thirdAssemblyId),
-    "Too many pending chunk assemblies",
+  , "maxChunkBytes is invalid")
+
+let testRuntimeRejectsUnsafeMessageLimit = () => {
+  let pair = makePair()
+  throwsWith(
+    () => Runtime.make(pair.left, ~limits=limits(~maxBytes=63), ~handler=inertHandler)->ignore,
+    "Runtime limits are invalid",
   )
-  RequestHandler.cancel(state, "sender", firstAssemblyId)
-  RequestHandler.cancel(state, "sender", secondAssemblyId)
+}
 
-  let aggregateState = RequestHandler.makeState(
-    ~timeoutMs=100,
-    ~maxMessageBytes=20,
-    ~maxPendingRequests=3,
-    ~maxChunkBytes=8,
+let testStartFailureConsumesTransport = () => {
+  let transport = Runtime.makeTransport(
+    ~maxChunkBytes=64,
+    ~postMessage=_ => Ok(),
+    ~start=(~beginSession) => {
+      beginSession->ignore
+      JsError.throwWithMessage("start failed")
+    },
   )
-  let aggregateFirstId = Id.make()
-  let aggregateSecondId = Id.make()
-  let addAggregate = (messageId, index, total) =>
-    RequestHandler.make(
-      aggregateState,
-      ~userHandler=handler,
-      TransportMessage.IntermediateChunk(
-        TransportMessage.Chunk.make(~messageId, ~index, ~total, ~body="12345678"),
-      ),
-      (),
-      "sender",
-      None,
-    )->ignore
-  addAggregate(aggregateFirstId, 0, 3)
-  addAggregate(aggregateSecondId, 0, 2)
-  let aggregateLimitRejected = expectThrow(
-    () => addAggregate(aggregateFirstId, 1, 3),
-    "Chunk allocation exceeds maxMessageBytes",
+  let startFailed = throwsWith(
+    () => Runtime.make(transport, ~limits=limits(), ~handler=inertHandler)->ignore,
+    "start failed",
   )
-  let malformedData: Dict.t<Obj.t> = Dict.make()
-  malformedData->Dict.set("messageId", Obj.magic(Id.make()))
-  malformedData->Dict.set("index", Obj.magic(0.5))
-  malformedData->Dict.set("total", Obj.magic(1))
-  malformedData->Dict.set("body", Obj.magic("body"))
-  let malformedChunk: TransportMessage.chunk = Obj.magic(malformedData)
-  let malformedTypeRejected = expectThrow(
-    () =>
-      RequestHandler.make(
-        state,
-        ~userHandler=handler,
-        TransportMessage.FinalChunk(malformedChunk),
-        (),
-        "sender",
-        None,
-      )->ignore,
-    "Malformed chunk sequence",
+  let ownershipStayedTransferred = throwsWith(
+    () => Runtime.make(transport, ~limits=limits(), ~handler=inertHandler)->ignore,
+    "already been consumed",
   )
-  duplicateRejected &&
-  abandonedAssemblyCleared &&
-  oversizedRejected &&
-  assemblyLimitRejected &&
-  aggregateLimitRejected &&
-  malformedTypeRejected
+  startFailed && ownershipStayedTransferred
 }
 
-let testListenerRemoval = () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let handled = ref(0)
-  let handler = (_message, _sender, _signal) => {
-    handled := handled.contents + 1
-    Response.none
-  }
-  Runtime.OnMessage.addListener(right, handler)
-  Runtime.OnMessage.addListener(right, handler)
-  Runtime.OnMessage.removeListener(right, handler)
-  Runtime.cast(left, Notice("removed"))
-  Runtime.close(left)
-  Runtime.close(right)
-  handled.contents === 0
-}
-
-let testSecondHandlerRejected = () => {
-  let pair = makeTransportPair()
-  let runtime = Runtime.make(pair.left)
-  let first = (_message, _sender, _signal) => Response.none
-  let second = (_message, _sender, _signal) => Response.none
-  Runtime.OnMessage.addListener(runtime, first)
-  let rejected = expectThrow(
-    () => Runtime.OnMessage.addListener(runtime, second),
-    "Runtime already has a message handler",
-  )
-  Runtime.close(runtime)
-  rejected
-}
-
-let testContextValidity = () => Runtime.isContextValid(leftRuntime)
-
-let testValueRuntimeConstruction = () => {
-  let transport: Runtime.transport<unit, string> = {
-    requestTimeoutMs: 30,
-    maxMessageBytes: 32_000_000,
-    maxPendingRequests: 100,
-    maxChunkBytes: 1_000_000,
-    postMessage: _ => Error("Not connected"),
-    addMessageListener: _ => (),
-    removeMessageListener: _ => (),
-    addOpenListener: _ => (),
-    removeOpenListener: _ => (),
-    addCloseListener: _ => (),
-    removeCloseListener: _ => (),
-    isOpen: () => true,
-    isCurrentSender: _ => true,
-    senderKey: _ => "transport",
-    close: () => (),
-    extension: "transport state",
-  }
-  let runtime = Runtime.make(transport)
-  let removeOpenListener = Runtime.onOpen(runtime, () => ())
-  let removeCloseListener = Runtime.onClose(runtime, _reason => ())
-  let removeReconnectListener = Runtime.onReconnect(runtime, () => ())
-  removeOpenListener()
-  removeOpenListener()
-  removeCloseListener()
-  removeCloseListener()
-  removeReconnectListener()
-  removeReconnectListener()
-  let valid = Runtime.isContextValid(runtime)
-  Runtime.close(runtime)
-  valid && transport.extension === "transport state"
-}
-
-let testConcurrentRuntimeIsolation = async () => {
-  let firstPair = makeTransportPair()
-  let secondPair = makeTransportPair()
-  let firstLeft = Runtime.make(firstPair.left)
-  let firstRight = Runtime.make(firstPair.right)
-  let secondLeft = Runtime.make(secondPair.left)
-  let secondRight = Runtime.make(secondPair.right)
-  Runtime.OnMessage.addListener(firstRight, rightHandler)
-  Runtime.OnMessage.addListener(secondRight, rightHandler)
-
-  let firstResponse = Runtime.sendMessage(firstLeft, Echo("first"))
-  let secondResponse = Runtime.sendMessage(secondLeft, Echo("second"))
-  let firstSucceeded = (await firstResponse) === "first"
-  let secondSucceeded = (await secondResponse) === "second"
-  Runtime.cast(secondLeft, Notice("isolated cast"))
-  let castSucceeded = receivedNotices.contents->Array.some(value => value === "isolated cast")
-
-  let abandoned = Runtime.sendMessage(firstLeft, NeverRespond)
-  Runtime.close(firstLeft)
-  Runtime.close(firstLeft)
-  let firstClosed = await expectRejection(abandoned, "Runtime closed")
-  let closedSend = await expectRejection(
-    Runtime.sendMessage(firstLeft, Echo("closed")),
-    "Runtime is closed",
-  )
-  let firstListenersRemoved =
-    firstPair.leftEndpoint.messageListeners.contents->Array.length === 0 &&
-      firstPair.leftEndpoint.closeListeners.contents->Array.length === 0
-  let secondStayedOpen =
-    (await Runtime.sendMessage(secondLeft, Echo("still open"))) === "still open"
-
-  Runtime.close(secondLeft)
-  firstSucceeded &&
-  secondSucceeded &&
-  castSucceeded &&
-  firstClosed &&
-  closedSend &&
-  firstListenersRemoved &&
-  secondStayedOpen
-}
-
-let testLifecycleSubscriptions = () => {
-  let pair = makeTransportPair(~initiallyOpen=false)
-  let runtime = Runtime.make(pair.left)
-  let openCount = ref(0)
-  let closeCount = ref(0)
-  let reconnectCount = ref(0)
-  let removedCloseCount = ref(0)
-  let removeOpen = Runtime.onOpen(runtime, () => openCount := openCount.contents + 1)
-  let removeClose = Runtime.onClose(runtime, _reason => closeCount := closeCount.contents + 1)
-  let removeReconnect = Runtime.onReconnect(runtime, () =>
-    reconnectCount := reconnectCount.contents + 1
-  )
-  let removeUnusedClose = Runtime.onClose(runtime, _reason =>
-    removedCloseCount := removedCloseCount.contents + 1
-  )
-  removeUnusedClose()
-
-  pair.openEndpoints()
-  pair.openEndpoints()
-  let lateOpenCount = ref(0)
-  let removeLateOpen = Runtime.onOpen(runtime, () => lateOpenCount := lateOpenCount.contents + 1)
-  pair.closeEndpoints("Connection lost")
-  pair.openEndpoints()
-  removeLateOpen()
-  removeOpen()
-  removeReconnect()
-  Runtime.close(runtime)
-  Runtime.close(runtime)
-  pair.openEndpoints()
-  removeClose()
-
-  openCount.contents === 1 &&
-  closeCount.contents === 2 &&
-  reconnectCount.contents === 1 &&
-  removedCloseCount.contents === 0 &&
-  lateOpenCount.contents === 0
-}
-
-let testLifecycleListenerFailures = () => {
-  let pair = makeTransportPair(~initiallyOpen=false)
-  let runtime = Runtime.make(pair.left)
-  let openCount = ref(0)
-  let closeCount = ref(0)
-  let reconnectCount = ref(0)
-  Runtime.onOpen(runtime, () => JsError.throwWithMessage("open listener failed"))->ignore
-  Runtime.onOpen(runtime, () => openCount := openCount.contents + 1)->ignore
-  Runtime.onClose(runtime, _reason => JsError.throwWithMessage("close listener failed"))->ignore
-  Runtime.onClose(runtime, _reason => closeCount := closeCount.contents + 1)->ignore
-  Runtime.onReconnect(runtime, () => JsError.throwWithMessage("reconnect listener failed"))->ignore
-  Runtime.onReconnect(runtime, () => reconnectCount := reconnectCount.contents + 1)->ignore
-
-  pair.openEndpoints()
-  pair.closeEndpoints("Connection lost")
-  pair.openEndpoints()
-  Runtime.close(runtime)
-
-  openCount.contents === 1 &&
-  closeCount.contents === 2 &&
-  reconnectCount.contents === 1 &&
-  pair.leftEndpoint.messageListeners.contents->Array.length === 0 &&
-  pair.leftEndpoint.openListeners.contents->Array.length === 0 &&
-  pair.leftEndpoint.closeListeners.contents->Array.length === 0
-}
-
-let testLifecycleCloseReentrancy = () => {
-  let pair = makeTransportPair(~initiallyOpen=false)
-  let runtime = Runtime.make(pair.left)
-  Runtime.onClose(runtime, _reason => Runtime.close(runtime))->ignore
-
-  pair.openEndpoints()
-  pair.closeEndpoints("Connection lost")
-
-  !Runtime.isContextValid(runtime) &&
-  pair.leftEndpoint.messageListeners.contents->Array.length === 0 &&
-  pair.leftEndpoint.openListeners.contents->Array.length === 0 &&
-  pair.leftEndpoint.closeListeners.contents->Array.length === 0
-}
-
-let testDeferredResponseAfterClose = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-
-  let pending = Runtime.sendMessage(left, AsyncEcho("late"))
-  Runtime.close(right)
-  let rejected = await expectRejection(pending, "Endpoint closed")
-  await Promise.resolve()
-  rejected
-}
-
-let testPreAbortedRequest = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let controller = AbortController.make()
-  controller->AbortController.abort
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, Echo("cancelled"), ~signal=controller->AbortController.signal),
-    "Request aborted",
-  )
-  Runtime.close(left)
-  rejected && pair.leftEndpoint.postCount.contents === 0
-}
-
-let makeCancellableHandler = (started, aborted) => {
-  let handler:
-    type response. (Types.message<response>, unit, option<AbortSignal.t>) => Response.t<response> =
-    (message, _sender, signal) => {
-      switch message {
-      | Cancellable => {
-          started := started.contents + 1
-          switch signal {
-          | Some(signal) =>
-            AbortSignal.addEventListener(signal, "abort", () => aborted := aborted.contents + 1)
-          | None => ()
-          }
-          Response.later(Promise.make((_resolve, _reject) => ()))
-        }
-      | Echo(value) => Response.now(value)
-      | _ => Response.none
-      }
-    }
-  handler
-}
-
-let testInflightCancellation = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
-  let controller = AbortController.make()
-  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  controller->AbortController.abort
-  controller->AbortController.abort
-  let rejected = await expectRejection(pending, "Request aborted")
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && started.contents === 1 && aborted.contents === 1
-}
-
-let testRemovedHandlerStillCancelsActiveRequest = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  let handler = makeCancellableHandler(started, aborted)
-  Runtime.OnMessage.addListener(right, handler)
-  let controller = AbortController.make()
-  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  Runtime.OnMessage.removeListener(right, handler)
-  controller->AbortController.abort
-  let rejected = await expectRejection(pending, "Request aborted")
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && started.contents === 1 && aborted.contents === 1
-}
-
-let testCancelledRequestReplayIgnored = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  let request = ref(None)
-  Runtime.OnMessage.addListener(right, (message, _sender, signal) => {
-    switch message {
-    | Cancellable => {
-        started := started.contents + 1
-        signal->Option.forEach(signal =>
-          AbortSignal.addEventListener(
-            signal,
-            "abort",
-            () => {
-              aborted := aborted.contents + 1
-              request.contents->Option.forEach(
-                request =>
-                  pair.rightEndpoint.messageListeners.contents->Array.forEach(
-                    listener => listener(request, ()),
-                  ),
-              )
-            },
-          )
-        )
-        Response.later(Promise.make((_resolve, _reject) => ()))
-      }
-    | _ => Response.none
-    }
-  })
-  let controller = AbortController.make()
-  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  request := pair.leftEndpoint.lastPosted.contents
-  controller->AbortController.abort
-  request.contents->Option.forEach(request =>
-    pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
-  )
-  let rejected = await expectRejection(pending, "Request aborted")
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && started.contents === 1 && aborted.contents === 1
-}
-
-let testNoResponseReplayIgnored = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let handled = ref(0)
-  Runtime.OnMessage.addListener(right, (_message, _sender, _signal) => {
-    handled := handled.contents + 1
-    Response.none
-  })
-  let pending = Runtime.sendMessage(left, NeverRespond)
-  let request = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow
-  pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
-  Runtime.close(left)
-  let rejected = await expectRejection(pending, "Runtime closed")
-  Runtime.close(right)
-  rejected && handled.contents === 1
-}
-
-let testResponseWinsAbortRace = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
-  let controller = AbortController.make()
-  let response = Runtime.sendMessage(
-    left,
-    Echo("response won"),
-    ~signal=controller->AbortController.signal,
-  )
-  controller->AbortController.abort
-  let value = await response
-  Runtime.close(left)
-  Runtime.close(right)
-  value === "response won" && aborted.contents === 0
-}
-
-let testTimeoutCancelsRemote = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
-  let rejected = await expectRejection(Runtime.sendMessage(left, Cancellable), "Request timed out")
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && started.contents === 1 && aborted.contents === 1
-}
-
-let testDisconnectCancelsRemote = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
-  let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
-  let controller = AbortController.make()
-  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  pair.closeEndpoints("Connection replaced")
-  controller->AbortController.abort
-  let rejected = await expectRejection(pending, "Connection replaced")
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && started.contents === 1 && aborted.contents === 1
-}
-
-let testChunkCancellationBetweenParts = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let controller = AbortController.make()
-  pair.leftEndpoint.afterPost :=
-    (
-      () => {
-        if pair.leftEndpoint.postCount.contents === 1 {
-          controller->AbortController.abort
-        }
-      }
-    )
-
-  let value = "x"->String.repeat(MessageChunker.defaultChunkSize + 1000)
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, Echo(value), ~signal=controller->AbortController.signal),
-    "Request aborted",
-  )
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected && pair.leftEndpoint.postCount.contents === 2
-}
-
-let testMessageSizeLimit = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, Echo("x"->String.repeat(200))),
-    "maxMessageBytes",
-  )
-  Runtime.close(left)
-  rejected && pair.leftEndpoint.postCount.contents === 0
-}
-
-let testResponseSizeLimit = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, LargeResponse(200)),
-    "Response exceeds maxMessageBytes",
-  )
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected
-}
-
-let testLargeResponseRoundTrip = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=1000, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let response = await Runtime.sendMessage(left, LargeResponse(200))
-  Runtime.close(left)
-  Runtime.close(right)
-  response === "r"->String.repeat(200)
-}
-
-let testStaleRequestIgnored = () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let received = ref(0)
-  let handler = (_message, _sender, _signal) => {
-    received := received.contents + 1
-    Response.none
-  }
-  Runtime.OnMessage.addListener(right, handler)
-  pair.rightEndpoint.isCurrentSender := false
+let testReplacementSessionCapabilitiesAreStale = () => {
+  let pair = makePair()
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler)
   Runtime.cast(left, Notice("stale"))
+  let payload = pair.leftEndpoint.posts.contents[0]->Option.getOrThrow
+  let staleSession = currentSession(pair.rightEndpoint)
+  let current = beginEndpointSession(pair.rightEndpoint)
+  staleSession.opened()
+  let staleOpenIgnored = Runtime.status(right) === Runtime.Connecting
+  current.opened()
+  staleSession.message(payload, ())
+  staleSession.disconnected("stale disconnect")
+  let passed =
+    staleOpenIgnored &&
+    Runtime.status(right) === Runtime.Open &&
+    !(receivedNotices.contents->Array.includes("stale"))
   Runtime.close(left)
   Runtime.close(right)
-  received.contents === 0
+  passed
 }
 
-let testMalformedProtocolIgnored = () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let ignored = try {
-    pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(nullValue, ()))
-    true
-  } catch {
-  | _ => false
+let testPreOpenMessageIgnored = () => {
+  let pair = makePair(~openOnStart=false)
+  let handled = ref(0)
+  let preOpenHandler = (_message, _sender, _context) => {
+    handled := handled.contents + 1
+    Response.none
   }
-  Runtime.close(left)
-  Runtime.close(right)
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=preOpenHandler)
+  currentSession(pair.leftEndpoint).message(
+    protocol("Cast", [("_0", Obj.magic(Notice("pre-open")))]),
+    (),
+  )
+  let ignored = handled.contents === 0 && Runtime.status(runtime) === Runtime.Connecting
+  Runtime.close(runtime)
   ignored
 }
 
-let testStaleResponseIgnored = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  pair.leftEndpoint.isCurrentSender := false
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, Echo("stale")),
-    "Request timed out",
-  )
+let testTerminalClose = () => {
+  let pair = makePair()
+  pair.leftEndpoint.teardownThrows := true
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let observed = ref([])
+  Runtime.onStatus(runtime, state => observed := observed.contents->Array.concat([state]))->ignore
+  let staleSession = currentSession(pair.leftEndpoint)
+  Runtime.close(runtime)
+  staleSession.opened()
+  Runtime.close(runtime)
+  runtime->Runtime.status->isClosed &&
+  pair.leftEndpoint.teardownCount.contents === 1 &&
+  observed.contents->Array.length === 1
+}
+
+let testDuplicateOpenedDoesNotNotify = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let openCount = ref(0)
+  Runtime.onStatus(runtime, status => {
+    if status === Runtime.Open {
+      openCount := openCount.contents + 1
+    }
+  })->ignore
+  currentSession(pair.leftEndpoint).opened()
+  Runtime.close(runtime)
+  openCount.contents === 0
+}
+
+let testClosedRuntimeRejectsStatusSubscription = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let staleSession = currentSession(pair.leftEndpoint)
+  Runtime.close(runtime)
+  let called = ref(0)
+  let unsubscribe = Runtime.onStatus(runtime, _ => called := called.contents + 1)
+  staleSession.opened()
+  unsubscribe()
+  unsubscribe()
+  called.contents === 0
+}
+
+let testStatusListenerIsolation = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let called = ref(0)
+  Runtime.onStatus(runtime, _ => JsError.throwWithMessage("listener failed"))->ignore
+  Runtime.onStatus(runtime, _ => called := called.contents + 1)->ignore
+  currentSession(pair.leftEndpoint).disconnected("offline")
+  Runtime.close(runtime)
+  called.contents === 2 && runtime->Runtime.status->isClosed
+}
+
+let testStatusCloseReentrancySuppressesStaleOpen = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let laterStatuses = ref([])
+  Runtime.onStatus(runtime, status => {
+    if status === Runtime.Open {
+      Runtime.close(runtime)
+    }
+  })->ignore
+  Runtime.onStatus(runtime, status =>
+    laterStatuses := laterStatuses.contents->Array.concat([status])
+  )->ignore
+  let replacement = beginEndpointSession(pair.leftEndpoint)
+  replacement.opened()
+  laterStatuses.contents->Array.length === 2 &&
+  laterStatuses.contents[0] === Some(Runtime.Connecting) &&
+  laterStatuses.contents[1]->Option.mapOr(false, isClosed)
+}
+
+let testReplacementCapabilityStaysStaleAfterConnectingClose = () => {
+  let pair = makePair()
+  let handled = ref(0)
+  let countingHandler = (_message, _sender, _context) => {
+    handled := handled.contents + 1
+    Response.none
+  }
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=countingHandler)
+  Runtime.onStatus(runtime, status => {
+    if status === Runtime.Connecting {
+      Runtime.close(runtime)
+    }
+  })->ignore
+
+  let staleSession = beginEndpointSession(pair.leftEndpoint)
+  staleSession.opened()
+  staleSession.message(protocol("Cast", [("_0", Obj.magic(Notice("stale")))]), ())
+  staleSession.disconnected("stale disconnect")
+
+  runtime->Runtime.status->isClosed &&
+  handled.contents === 0 &&
+  pair.leftEndpoint.teardownCount.contents === 1
+}
+
+let testDirectAndChunkedRoundTrip = async () => {
+  let (pair, left, right) = makeRuntimes(~maxChunkBytes=32)
+  let direct = await Runtime.sendMessage(left, Echo("small"))
+  let largeValue = "x"->String.repeat(500)
+  let chunked = await Runtime.sendMessage(left, Echo(largeValue))
+  Runtime.cast(left, Notice("direct cast"))
+  Runtime.cast(left, Notice(largeValue))
+  let passed =
+    direct === "small" &&
+    chunked === largeValue &&
+    pair.leftEndpoint.posts.contents->Array.length > 4 &&
+    receivedNotices.contents->Array.includes("direct cast") &&
+    receivedNotices.contents->Array.includes(largeValue)
   Runtime.close(left)
   Runtime.close(right)
-  rejected
+  passed
 }
 
-let testMissingSuccessValueRejected = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let pending = Runtime.sendMessage(left, Echo("request"))
-  let request: Dict.t<Obj.t> = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow->Obj.magic
-  let response: Dict.t<Obj.t> = Dict.make()
-  response->Dict.set("TAG", Obj.magic("Success"))
-  response->Dict.set("id", request->Dict.get("id")->Option.getOrThrow)
-  pair.leftEndpoint.messageListeners.contents->Array.forEach(listener =>
-    listener(Obj.magic(response), ())
+let testChunkedRequestUsesOnePendingSlot = async () => {
+  let (pair, left, right) = makeRuntimes(
+    ~maxChunkBytes=24,
+    ~leftLimits=limits(~timeout=15, ~maxPending=1),
   )
-  let rejected = await expectRejection(pending, "Invalid response payload")
-  Runtime.close(left)
-  rejected
-}
-
-let testUnitResponseWithinLimits = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  await Runtime.sendMessage(left, UnitResponse)
+  let pending = Runtime.sendMessage(left, NeverLarge("x"->String.repeat(500)))
+  let blocked = await rejectsWith(Runtime.sendMessage(left, Echo("blocked")), "Too many pending")
+  let timedOut = await rejectsWith(pending, "timed out")
+  let sentChunksAndOneCancel = pair.leftEndpoint.posts.contents->Array.length > 10
   Runtime.close(left)
   Runtime.close(right)
-  true
+  blocked && timedOut && sentChunksAndOneCancel
 }
 
-let testUncloneableResponseFailure = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let rejected = await expectRejection(
-    Runtime.sendMessage(left, UncloneableResponse),
-    "Response could not be serialized",
-  )
-  Runtime.close(left)
-  Runtime.close(right)
-  rejected
-}
-
-let testBinaryPayloadRejection = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=500, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let requestRejected = await expectRejection(
-    Runtime.sendMessage(left, BinaryRequest(makeArrayBuffer(1000))),
-    "JSON-compatible",
-  )
-  let responseRejected = await expectRejection(
-    Runtime.sendMessage(left, BinaryResponse),
-    "Response could not be serialized",
-  )
-  let spoofedBuffer = makeArrayBuffer(1000)
-  (Obj.magic(spoofedBuffer): Dict.t<Obj.t>)->Dict.set("constructor", objectConstructorValue)
-  let spoofedRejected = await expectRejection(
-    Runtime.sendMessage(left, BinaryRequest(spoofedBuffer)),
-    "JSON-compatible",
-  )
-  let prototypeSpoofedBuffer = makeArrayBuffer(1000)
-  setPrototypeOf(prototypeSpoofedBuffer, objectPrototypeValue)->ignore
-  let prototypeSpoofedRejected = await expectRejection(
-    Runtime.sendMessage(left, BinaryRequest(prototypeSpoofedBuffer)),
-    "JSON-compatible",
-  )
-  let nonFiniteRejected = await expectRejection(
-    Runtime.sendMessage(left, NumberEcho(0.0 /. 0.0)),
-    "JSON-compatible",
-  )
-  let shared: Dict.t<Obj.t> = Dict.make()
-  shared->Dict.set("value", Obj.magic("shared"))
-  let repeated: Dict.t<Obj.t> = Dict.make()
-  repeated->Dict.set("before", Obj.magic(shared))
-  repeated->Dict.set("after", Obj.magic(shared))
-  let repeatedReferenceAccepted = await Runtime.sendMessage(
-    left,
-    BinaryRequest(Obj.magic(repeated)),
-  )
-  Runtime.close(left)
-  Runtime.close(right)
-  requestRejected &&
-  responseRejected &&
-  spoofedRejected &&
-  prototypeSpoofedRejected &&
-  nonFiniteRejected &&
-  repeatedReferenceAccepted
-}
-
-let testPendingRequestLimit = async () => {
-  let pair = makeTransportPair(~maxPendingRequests=1)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let first = Runtime.sendMessage(left, NeverRespond)
-  let secondRejected = await expectRejection(
-    Runtime.sendMessage(left, Echo("blocked")),
-    "Too many pending requests",
-  )
-  Runtime.close(left)
-  let firstRejected = await expectRejection(first, "Runtime closed")
-  Runtime.close(right)
-  secondRejected && firstRejected
-}
-
-let testInboundRequestLimit = async () => {
-  let pair = makeTransportPair(~maxPendingRequests=10, ~receiverMaxPendingRequests=1)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let started = ref(0)
+let testPreAndInflightAbort = async () => {
+  let pair = makePair()
   let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
+  let cancellableHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, context) =>
+      switch message {
+      | Cancellable =>
+        switch context {
+        | Runtime.Request(signal) => {
+            AbortSignal.onAbort(signal, () => aborted := aborted.contents + 1)->ignore
+            Response.later(Promise.make((_resolve, _reject) => ()))
+          }
+        | Runtime.Cast => Response.none
+        }
+      | Echo(value) => Response.now(value)
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=cancellableHandler)
+  let preController = AbortController.make()
+  preController->AbortController.abort
+  let pre = await rejectsWith(
+    Runtime.sendMessage(left, Echo("pre"), ~signal=preController->AbortController.signal),
+    "aborted",
+  )
   let controller = AbortController.make()
-  let first = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  let secondRejected = await expectRejection(
-    Runtime.sendMessage(left, Cancellable),
-    "Too many pending requests",
+  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
+  controller->AbortController.abort
+  let inflight = await rejectsWith(pending, "aborted")
+  Runtime.close(left)
+  Runtime.close(right)
+  pre && inflight && aborted.contents === 1
+}
+
+let testBoundedInboundOperations = async () => {
+  let (_pair, left, right) = makeRuntimes(~rightLimits=limits(~maxPending=1))
+  let first = Runtime.sendMessage(left, Never)
+  let second = await rejectsWith(Runtime.sendMessage(left, Never), "Too many pending")
+  Runtime.close(left)
+  let firstClosed = await rejectsWith(first, "Runtime closed")
+  Runtime.close(right)
+  second && firstClosed
+}
+
+let testMalformedOrderedChunks = async () => {
+  let pair = makePair(~maxChunkBytes=20)
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler)
+  let pending = Runtime.sendMessage(left, Echo("z"->String.repeat(200)))
+  let secondChunk = pair.leftEndpoint.posts.contents[1]->Option.getOrThrow
+  pair.leftEndpoint.deliver(secondChunk)
+  let rejected = await rejectsWith(pending, "Malformed chunk sequence")
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected
+}
+
+let testInvalidChunkDoesNotDeleteExecution = async () => {
+  let pair = makePair()
+  let aborted = ref(0)
+  let activeHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, context) =>
+      switch message {
+      | Cancellable =>
+        switch context {
+        | Runtime.Request(signal) => {
+            AbortSignal.onAbort(signal, () => aborted := aborted.contents + 1)->ignore
+            Response.later(Promise.make((_resolve, _reject) => ()))
+          }
+        | Runtime.Cast => Response.none
+        }
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=activeHandler)
+  let controller = AbortController.make()
+  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
+  let id = field(pair.leftEndpoint.posts.contents[0]->Option.getOrThrow, "id")
+  pair.leftEndpoint.deliver(
+    protocol(
+      "CastChunk",
+      [("id", id), ("index", Obj.magic(1)), ("total", Obj.magic(2)), ("body", Obj.magic("x"))],
+    ),
   )
   controller->AbortController.abort
-  let firstRejected = await expectRejection(first, "Request aborted")
+  let rejected = await rejectsWith(pending, "aborted")
   Runtime.close(left)
   Runtime.close(right)
-  secondRejected && firstRejected && started.contents === 1 && aborted.contents === 1
+  rejected && aborted.contents === 1
 }
 
-let testConfiguredChunkSize = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=10_000, ~maxChunkBytes=100)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let value = "c"->String.repeat(1000)
-  let response = await Runtime.sendMessage(left, Echo(value))
+let testMalformedCorrelatedResponsesRejectImmediately = async () => {
+  let pair = makePair()
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(~timeout=100), ~handler)
+  let missingValue = Runtime.sendMessage(left, Echo("missing"))
+  let firstId = field(pair.leftEndpoint.posts.contents[0]->Option.getOrThrow, "id")
+  currentSession(pair.leftEndpoint).message(protocol("Success", [("id", firstId)]), ())
+  let missingRejected = await rejectsWith(missingValue, "Invalid response payload")
+
+  let secondStart = pair.leftEndpoint.posts.contents->Array.length
+  let wrongFailure = Runtime.sendMessage(left, Echo("wrong failure"))
+  let secondId = field(pair.leftEndpoint.posts.contents[secondStart]->Option.getOrThrow, "id")
+  currentSession(pair.leftEndpoint).message(
+    protocol("Failure", [("id", secondId), ("message", Obj.magic(42))]),
+    (),
+  )
+  let failureRejected = await rejectsWith(wrongFailure, "Invalid response payload")
+  Runtime.close(left)
+  missingRejected && failureRejected
+}
+
+let testOversizedFailureIsInvalidResponse = async () => {
+  let pair = makePair()
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(~maxBytes=64), ~handler)
+  let pending = Runtime.sendMessage(left, Echo("error"))
+  let id = field(pair.leftEndpoint.posts.contents[0]->Option.getOrThrow, "id")
+  currentSession(pair.leftEndpoint).message(
+    protocol("Failure", [("id", id), ("message", Obj.magic("e"->String.repeat(65)))]),
+    (),
+  )
+  let rejected = await rejectsWith(pending, "Invalid response payload")
+  Runtime.close(left)
+  rejected
+}
+
+let testConnectionReplacementCommitsBeforeAbort = async () => {
+  let pair = makePair()
+  let reentrant = ref(None)
+  let runtimeRef: ref<option<Runtime.t<unit>>> = ref(None)
+  let reentrantHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, context) =>
+      switch message {
+      | Cancellable =>
+        switch context {
+        | Runtime.Request(signal) => {
+            AbortSignal.onAbort(signal, () => {
+              runtimeRef.contents->Option.forEach(runtime =>
+                reentrant := Some(Runtime.sendMessage(runtime, Echo("reentrant")))
+              )
+            })->ignore
+            Response.later(Promise.make((_resolve, _reject) => ()))
+          }
+        | Runtime.Cast => Response.none
+        }
+      | Echo(value) => Response.now(value)
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(~timeout=100), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(~timeout=100), ~handler=reentrantHandler)
+  runtimeRef := Some(right)
+  Runtime.sendMessage(left, Cancellable)->Promise.catch(_ => Promise.resolve(""))->ignore
+  let replacement = beginEndpointSession(pair.rightEndpoint)
+  replacement.opened()
+  let rejectedDuringReplacement = switch reentrant.contents {
+  | Some(promise) => await rejectsWith(promise, "not connected")
+  | None => false
+  }
   Runtime.close(left)
   Runtime.close(right)
-  response === value && pair.leftEndpoint.postCount.contents > 2
+  rejectedDuringReplacement
 }
 
-let testCastMessageSizeLimit = () => {
-  let pair = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=50)
-  let runtime = Runtime.make(pair.left)
+let testDisconnectCommitsBeforeAbort = async () => {
+  let pair = makePair()
+  let reentrant = ref(None)
+  let runtimeRef: ref<option<Runtime.t<unit>>> = ref(None)
+  let reentrantHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, context) =>
+      switch message {
+      | Cancellable =>
+        switch context {
+        | Runtime.Request(signal) => {
+            AbortSignal.onAbort(signal, () => {
+              runtimeRef.contents->Option.forEach(runtime =>
+                reentrant := Some(Runtime.sendMessage(runtime, Echo("dead")))
+              )
+            })->ignore
+            Response.later(Promise.make((_resolve, _reject) => ()))
+          }
+        | Runtime.Cast => Response.none
+        }
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(~timeout=100), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(~timeout=100), ~handler=reentrantHandler)
+  runtimeRef := Some(right)
+  Runtime.sendMessage(left, Cancellable)->Promise.catch(_ => Promise.resolve(""))->ignore
+  let postCount = pair.rightEndpoint.posts.contents->Array.length
+  currentSession(pair.rightEndpoint).disconnected("offline")
+  let rejected = switch reentrant.contents {
+  | Some(promise) => await rejectsWith(promise, "not connected")
+  | None => false
+  }
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected && pair.rightEndpoint.posts.contents->Array.length === postCount
+}
+
+let testAbandonedAssemblyReleasesCapacity = async () => {
+  let pair = makePair(~maxChunkBytes=20)
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(~timeout=15), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(~timeout=15, ~maxPending=1), ~handler)
+  let abandoned = Runtime.sendMessage(left, Echo("a"->String.repeat(200)))
+  abandoned->Promise.catch(_ => Promise.resolve(""))->ignore
+  let firstChunk = pair.leftEndpoint.posts.contents[0]->Option.getOrThrow
+  pair.leftEndpoint.deliver(firstChunk)
+  await wait(30)
+
+  let start = pair.leftEndpoint.posts.contents->Array.length
+  let second = Runtime.sendMessage(left, Echo("b"->String.repeat(200)))
+  pair.leftEndpoint.posts.contents
+  ->Array.slice(~start, ~end=pair.leftEndpoint.posts.contents->Array.length)
+  ->Array.forEach(pair.leftEndpoint.deliver)
+  let completed = (await second) === "b"->String.repeat(200)
+  Runtime.close(left)
+  Runtime.close(right)
+  completed
+}
+
+let testInboundChunkSizeUsesReceiverLimit = async () => {
+  let oversizedPair = makePair(~maxChunkBytes=64, ~rightMaxChunkBytes=16)
+  let oversizedLeft = Runtime.make(oversizedPair.left, ~limits=limits(), ~handler)
+  let oversizedRight = Runtime.make(oversizedPair.right, ~limits=limits(), ~handler)
+  let oversized = Runtime.sendMessage(oversizedLeft, Echo("x"->String.repeat(200)))
+  let oversizedRejected = await rejectsWith(oversized, "Chunk exceeds maxChunkBytes")
+  let stoppedAfterRejection = oversizedPair.leftEndpoint.posts.contents->Array.length === 1
+  Runtime.close(oversizedLeft)
+  Runtime.close(oversizedRight)
+
+  let smallerPair = makePair(~maxChunkBytes=8, ~rightMaxChunkBytes=16)
+  let smallerLeft = Runtime.make(smallerPair.left, ~limits=limits(), ~handler)
+  let smallerRight = Runtime.make(smallerPair.right, ~limits=limits(), ~handler)
+  let value = "y"->String.repeat(100)
+  let smallerAccepted = (await Runtime.sendMessage(smallerLeft, Echo(value))) === value
+  Runtime.close(smallerLeft)
+  Runtime.close(smallerRight)
+  oversizedRejected && stoppedAfterRejection && smallerAccepted
+}
+
+let testEmptyChunkAndAggregateAssemblyBytes = async () => {
+  let emptyPair = makePair(~maxChunkBytes=20)
+  emptyPair.leftEndpoint.autoDeliver := false
+  let emptyLeft = Runtime.make(emptyPair.left, ~limits=limits(), ~handler)
+  let emptyRight = Runtime.make(emptyPair.right, ~limits=limits(), ~handler)
+  let emptyPending = Runtime.sendMessage(emptyLeft, Echo("x"->String.repeat(100)))
+  let emptyChunk: Dict.t<Obj.t> =
+    emptyPair.leftEndpoint.posts.contents[0]->Option.getOrThrow->Obj.magic
+  emptyChunk->Dict.set("body", Obj.magic(""))
+  emptyPair.leftEndpoint.deliver(Obj.magic(emptyChunk))
+  let emptyRejected = await rejectsWith(emptyPending, "Malformed chunk sequence")
+  Runtime.close(emptyLeft)
+  Runtime.close(emptyRight)
+
+  let aggregatePair = makePair(~maxChunkBytes=40)
+  aggregatePair.leftEndpoint.autoDeliver := false
+  let aggregateLeft = Runtime.make(aggregatePair.left, ~limits=limits(~maxBytes=1000), ~handler)
+  let aggregateRight = Runtime.make(
+    aggregatePair.right,
+    ~limits=limits(~maxBytes=64, ~maxPending=2),
+    ~handler,
+  )
+  let first = Runtime.sendMessage(aggregateLeft, Echo("a"->String.repeat(100)))
+  first->Promise.catch(_ => Promise.resolve(""))->ignore
+  let secondStart = aggregatePair.leftEndpoint.posts.contents->Array.length
+  let second = Runtime.sendMessage(aggregateLeft, Echo("b"->String.repeat(100)))
+  aggregatePair.leftEndpoint.deliver(
+    aggregatePair.leftEndpoint.posts.contents[0]->Option.getOrThrow,
+  )
+  aggregatePair.leftEndpoint.deliver(
+    aggregatePair.leftEndpoint.posts.contents[secondStart]->Option.getOrThrow,
+  )
+  let aggregateRejected = await rejectsWith(second, "Chunk allocation exceeds maxMessageBytes")
+  Runtime.close(aggregateLeft)
+  Runtime.close(aggregateRight)
+  emptyRejected && aggregateRejected
+}
+
+let testSenderChunkLimitsAndPartialFailure = async () => {
+  let tinyPair = makePair(~maxChunkBytes=4)
+  let tinyLeft = Runtime.make(tinyPair.left, ~limits=limits(~maxBytes=50_000), ~handler)
+  let tooMany = await rejectsWith(
+    Runtime.sendMessage(tinyLeft, Echo("x"->String.repeat(40_000))),
+    "Too many chunks",
+  )
+  let allocatedNothing = tinyPair.leftEndpoint.posts.contents->Array.length === 0
+  Runtime.close(tinyLeft)
+
+  let failingPair = makePair(~maxChunkBytes=20)
+  failingPair.leftEndpoint.failPostAt := Some(2)
+  let failingLeft = Runtime.make(failingPair.left, ~limits=limits(), ~handler)
+  let failingRight = Runtime.make(failingPair.right, ~limits=limits(), ~handler)
+  let partialRejected = await rejectsWith(
+    Runtime.sendMessage(failingLeft, Echo("p"->String.repeat(200))),
+    "post failed",
+  )
+  let sentCancel = failingPair.leftEndpoint.posts.contents->Array.length === 3
+  Runtime.close(failingLeft)
+  Runtime.close(failingRight)
+  tooMany && allocatedNothing && partialRejected && sentCancel
+}
+
+let testReceiverExecutionTimeoutAndNoResponse = async () => {
+  let timedPair = makePair()
+  let aborted = ref(0)
+  let timeoutHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, context) =>
+      switch message {
+      | Cancellable =>
+        switch context {
+        | Runtime.Request(signal) => {
+            AbortSignal.onAbort(signal, () => aborted := aborted.contents + 1)->ignore
+            Response.later(Promise.make((_resolve, _reject) => ()))
+          }
+        | Runtime.Cast => Response.none
+        }
+      | _ => Response.none
+      }
+  let timedLeft = Runtime.make(timedPair.left, ~limits=limits(~timeout=100), ~handler)
+  let timedRight = Runtime.make(
+    timedPair.right,
+    ~limits=limits(~timeout=15),
+    ~handler=timeoutHandler,
+  )
+  let remoteTimedOut = await rejectsWith(
+    Runtime.sendMessage(timedLeft, Cancellable),
+    "Request timed out",
+  )
+  Runtime.close(timedLeft)
+  Runtime.close(timedRight)
+
+  let noResponsePair = makePair()
+  let noResponseLeft = Runtime.make(noResponsePair.left, ~limits=limits(~timeout=100), ~handler)
+  let noResponseRight = Runtime.make(noResponsePair.right, ~limits=limits(), ~handler)
+  let immediateFailure = await rejectsWith(
+    Runtime.sendMessage(noResponseLeft, Ignored),
+    "Handler did not respond",
+  )
+  Runtime.close(noResponseLeft)
+  Runtime.close(noResponseRight)
+  remoteTimedOut && aborted.contents === 1 && immediateFailure
+}
+
+let testChunkAssemblyAndExecutionShareDeadline = async () => {
+  let pair = makePair(~maxChunkBytes=20)
+  pair.leftEndpoint.autoDeliver := false
+  let left = Runtime.make(pair.left, ~limits=limits(~timeout=300), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(~timeout=80), ~handler)
+  let settled = ref(false)
+  Runtime.sendMessage(left, NeverLarge("d"->String.repeat(200)))
+  ->Promise.catch(_ => {
+    settled := true
+    Promise.resolve("")
+  })
+  ->ignore
+  let chunks = pair.leftEndpoint.posts.contents->Array.copy
+  pair.leftEndpoint.deliver(chunks[0]->Option.getOrThrow)
+  await wait(50)
+  chunks
+  ->Array.slice(~start=1, ~end=chunks->Array.length)
+  ->Array.forEach(pair.leftEndpoint.deliver)
+  await wait(45)
+  let usedSingleDeadline = settled.contents
+  Runtime.close(left)
+  Runtime.close(right)
+  usedSingleDeadline
+}
+
+let testExceptionMessageIsTotal = async () => {
+  let (_pair, left, right) = makeRuntimes()
   let rejected = try {
-    Runtime.cast(runtime, Echo("x"->String.repeat(200)))
+    (await Runtime.sendMessage(left, ThrowUnstringifiable))->ignore
     false
   } catch {
-  | error =>
-    error
-    ->JsExn.fromException
-    ->Option.flatMap(JsExn.message)
-    ->Option.getOr("")
-    ->String.includes("maxMessageBytes")
+  | _ => true
   }
-  Runtime.close(runtime)
-  rejected && pair.leftEndpoint.postCount.contents === 0
+  let recovered = (await Runtime.sendMessage(left, Echo("recovered"))) === "recovered"
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected && recovered
 }
 
-let testInvalidRuntimeLimits = () => {
-  let tinyChunks = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=3)
-  let oversizedLimit = makeTransportPair(~maxMessageBytes=1_000_000_001, ~maxChunkBytes=100)
-  let nanLimit = makeTransportPair(~maxMessageBytes=Obj.magic(0.0 /. 0.0), ~maxChunkBytes=100)
-  let excessiveChunks = makeTransportPair(~maxMessageBytes=40_001, ~maxChunkBytes=4)
-  expectThrow(() => Runtime.make(tinyChunks.left)->ignore, "Runtime limits are invalid") &&
-  expectThrow(() => Runtime.make(oversizedLimit.left)->ignore, "Runtime limits are invalid") &&
-  expectThrow(() => Runtime.make(nanLimit.left)->ignore, "Runtime limits are invalid") &&
-  expectThrow(() => Runtime.make(excessiveChunks.left)->ignore, "Runtime limits are invalid")
+let testHandlerFailureIsolation = async () => {
+  let (_pair, left, right) = makeRuntimes()
+  let failed = await rejectsWith(Runtime.sendMessage(left, Fail), "handler failed")
+  let recovered = (await Runtime.sendMessage(left, Echo("still open"))) === "still open"
+  let stayedOpen = Runtime.status(right) === Runtime.Open
+  Runtime.close(left)
+  Runtime.close(right)
+  failed && recovered && stayedOpen
 }
 
-let testCloseRejectsPending = async () => {
-  let pending = Runtime.sendMessage(leftRuntime, NeverRespond)
-  Runtime.close(leftRuntime)
-  let rejected = await expectRejection(pending, "Runtime closed")
-  rejected && !Runtime.isContextValid(leftRuntime) && !Runtime.isContextValid(rightRuntime)
+let testAbortSubscriptionObservesExistingAbort = () => {
+  let controller = AbortController.make()
+  controller->AbortController.abort
+  let calls = ref(0)
+  let unsubscribe = AbortSignal.onAbort(controller->AbortController.signal, () =>
+    calls := calls.contents + 1
+  )
+  unsubscribe()
+  unsubscribe()
+  calls.contents === 1
 }
 
 let runTests = async () => {
   let syncTests = [
-    ("typed fire-and-forget cast", testCast),
-    ("listener removal", testListenerRemoval),
-    ("second handler rejected", testSecondHandlerRejected),
-    ("context validity", testContextValidity),
-    ("value runtime construction", testValueRuntimeConstruction),
-    ("removable lifecycle subscriptions", testLifecycleSubscriptions),
-    ("lifecycle listener failure isolation", testLifecycleListenerFailures),
-    ("lifecycle close reentrancy", testLifecycleCloseReentrancy),
-    ("chunk assemblies are sender scoped", testChunkAssembliesAreSenderScoped),
-    ("malformed chunk limits", testMalformedChunkLimits),
-    ("cast message size limit", testCastMessageSizeLimit),
-    ("stale request ignored", testStaleRequestIgnored),
-    ("malformed protocol ignored", testMalformedProtocolIgnored),
-    ("invalid runtime limits", testInvalidRuntimeLimits),
+    ("transport is single consumption", testTransportSingleConsumption),
+    ("transport rejects unsafe chunk cap", testTransportRejectsUnsafeChunkCap),
+    ("runtime rejects unsafe message limit", testRuntimeRejectsUnsafeMessageLimit),
+    ("start failure preserves transferred ownership", testStartFailureConsumesTransport),
+    ("replacement session capabilities become stale", testReplacementSessionCapabilitiesAreStale),
+    ("pre-open messages are ignored", testPreOpenMessageIgnored),
+    ("close is terminal and exception-safe", testTerminalClose),
+    ("duplicate open does not repeat Open status", testDuplicateOpenedDoesNotNotify),
+    ("closed runtime rejects status subscriptions", testClosedRuntimeRejectsStatusSubscription),
+    ("status listener failures are isolated", testStatusListenerIsolation),
+    ("close reentrancy suppresses stale Open", testStatusCloseReentrancySuppressesStaleOpen),
+    (
+      "replacement capability stays stale after Connecting close",
+      testReplacementCapabilityStaysStaleAfterConnectingClose,
+    ),
+    ("abort subscription observes existing abort", testAbortSubscriptionObservesExistingAbort),
   ]
   let asyncTests = [
-    ("typed request round trip", testRoundTrip),
-    ("reverse request round trip", testReverseRoundTrip),
-    ("deferred response round trip", testAsyncRoundTrip),
-    ("immediate remote error", testImmediateRemoteError),
-    ("deferred remote error", testDeferredRemoteError),
-    ("request timeout", testTimeout),
-    ("structured clone failure", testPostFailure),
-    ("chunked request round trip", testChunkedRoundTrip),
-    ("concurrent runtime isolation", testConcurrentRuntimeIsolation),
-    ("deferred response after close", testDeferredResponseAfterClose),
-    ("pre-aborted request", testPreAbortedRequest),
-    ("in-flight request cancellation", testInflightCancellation),
-    ("removed handler cancels active request", testRemovedHandlerStillCancelsActiveRequest),
-    ("cancelled request replay ignored", testCancelledRequestReplayIgnored),
-    ("no-response request replay ignored", testNoResponseReplayIgnored),
-    ("response wins abort race", testResponseWinsAbortRace),
-    ("timeout cancels remote handler", testTimeoutCancelsRemote),
-    ("disconnect cancels remote handler", testDisconnectCancelsRemote),
-    ("chunk cancellation between parts", testChunkCancellationBetweenParts),
-    ("message size limit", testMessageSizeLimit),
-    ("response size limit", testResponseSizeLimit),
-    ("large response round trip", testLargeResponseRoundTrip),
-    ("stale response ignored", testStaleResponseIgnored),
-    ("missing success value rejected", testMissingSuccessValueRejected),
-    ("unit response within limits", testUnitResponseWithinLimits),
-    ("uncloneable response failure", testUncloneableResponseFailure),
-    ("binary payload rejection", testBinaryPayloadRejection),
-    ("pending request limit", testPendingRequestLimit),
-    ("inbound request limit", testInboundRequestLimit),
-    ("configured chunk size", testConfiguredChunkSize),
-    ("close rejects pending requests", testCloseRejectsPending),
+    ("direct and chunked request/cast round trip", testDirectAndChunkedRoundTrip),
+    ("chunk count uses one pending slot and timeout", testChunkedRequestUsesOnePendingSlot),
+    ("pre-flight and in-flight abort", testPreAndInflightAbort),
+    ("inbound operation count is bounded", testBoundedInboundOperations),
+    ("chunks must arrive in exact order", testMalformedOrderedChunks),
+    ("invalid chunk cannot delete active execution", testInvalidChunkDoesNotDeleteExecution),
+    (
+      "malformed correlated responses reject immediately",
+      testMalformedCorrelatedResponsesRejectImmediately,
+    ),
+    ("oversized remote failure is invalid response", testOversizedFailureIsInvalidResponse),
+    ("replacement commits before abort callbacks", testConnectionReplacementCommitsBeforeAbort),
+    ("disconnect commits before abort callbacks", testDisconnectCommitsBeforeAbort),
+    ("abandoned assembly releases inbound capacity", testAbandonedAssemblyReleasesCapacity),
+    ("receiver chunk limit allows smaller peer chunks", testInboundChunkSizeUsesReceiverLimit),
+    ("empty and aggregate chunk bytes are bounded", testEmptyChunkAndAggregateAssemblyBytes),
+    ("sender chunk limits and partial failure", testSenderChunkLimitsAndPartialFailure),
+    (
+      "receiver execution timeout and no-response failure",
+      testReceiverExecutionTimeoutAndNoResponse,
+    ),
+    ("chunk assembly and execution share deadline", testChunkAssemblyAndExecutionShareDeadline),
+    ("exception message conversion is total", testExceptionMessageIsTotal),
+    ("handler failures do not close runtime", testHandlerFailureIsolation),
   ]
-
-  await TestUtils.runMixedTests("Runtime Integration Tests", syncTests, asyncTests)
+  await TestUtils.runMixedTests("Runtime Contract Tests", syncTests, asyncTests)
 }
 
 let main = runTests

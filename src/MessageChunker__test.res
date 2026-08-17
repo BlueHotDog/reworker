@@ -11,61 +11,9 @@ let createLargeString = size => {
   "a"->String.repeat(size)
 }
 
-// Test: Small messages should not be chunked
-let testSmallMessageNotChunked = () => {
-  let smallMessage = "Hello, world!"
-  let shouldChunk = smallMessage->MessageChunker.shouldBeChunked
-
-  if shouldChunk {
-    Console.error("FAIL: Small message incorrectly marked for chunking")
-    false
-  } else {
-    Console.log("PASS: Small message correctly not chunked")
-    true
-  }
-}
-
-// Test: Large messages should be chunked
-let testLargeMessageChunked = () => {
-  let largeMessage = createLargeString(MessageChunker.defaultChunkSize + 1000)
-  let shouldChunk = largeMessage->MessageChunker.shouldBeChunked
-
-  if shouldChunk {
-    Console.log("PASS: Large message correctly marked for chunking")
-    true
-  } else {
-    Console.error("FAIL: Large message incorrectly not marked for chunking")
-    false
-  }
-}
-
-// Test: Messages exactly at threshold
-let testThresholdBoundary = () => {
-  // JSON serialization adds two quote bytes around these ASCII strings.
-  let exactThreshold = createLargeString(MessageChunker.defaultChunkSize - 2)
-  let justOver = createLargeString(MessageChunker.defaultChunkSize - 1)
-  let justUnder = createLargeString(MessageChunker.defaultChunkSize - 3)
-
-  let exactShouldChunk = exactThreshold->MessageChunker.shouldBeChunked
-  let overShouldChunk = justOver->MessageChunker.shouldBeChunked
-  let underShouldChunk = justUnder->MessageChunker.shouldBeChunked
-
-  let results = [
-    (!underShouldChunk, "Just under threshold should not chunk"),
-    (overShouldChunk, "Just over threshold should chunk"),
-    (!exactShouldChunk, "Exact threshold should not chunk"),
-  ]
-
-  let allPassed = results->Array.every(((passed, message)) => {
-    if passed {
-      Console.log(`PASS: ${message}`)
-    } else {
-      Console.error(`FAIL: ${message}`)
-    }
-    passed
-  })
-
-  allPassed
+let testPreparedJson = () => {
+  let prepared = MessageChunker.prepareJson({"message": "hello"})
+  prepared.encoded->Option.isSome && prepared.byteLength === 19
 }
 
 // Test: Chunk splitting and reassembly
@@ -133,29 +81,12 @@ let testUnicodeHandling = () => {
   }
 }
 
-// Test: Empty message handling
-let testEmptyMessage = () => {
-  let emptyMessage = ""
-  let shouldChunk = emptyMessage->MessageChunker.shouldBeChunked
-
-  if shouldChunk {
-    Console.error("FAIL: Empty message incorrectly marked for chunking")
-    false
-  } else {
-    Console.log("PASS: Empty message correctly not chunked")
-    true
-  }
-}
-
 // Run all tests
 let runTests = () => {
   let tests = [
-    ("Small message not chunked", testSmallMessageNotChunked),
-    ("Large message chunked", testLargeMessageChunked),
-    ("Threshold boundary", testThresholdBoundary),
+    ("JSON preparation", testPreparedJson),
     ("Chunk split and reassemble", testChunkSplitAndReassemble),
     ("Unicode handling", testUnicodeHandling),
-    ("Empty message", testEmptyMessage),
   ]
 
   TestUtils.runSyncTests("MessageChunker Unit Tests", tests)
