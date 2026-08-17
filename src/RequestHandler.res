@@ -14,7 +14,7 @@
 // 2. TransportMessage.ChunkMessage: Collect chunks, reassemble when complete, forward to user handler
 
 type assembly = {
-  mutable chunks: array<TransportMessage.chunk>,
+  chunks: Map.t<int, TransportMessage.chunk>,
   total: int,
   mutable bytes: int,
   mutable timeoutId: timeoutId,
@@ -150,8 +150,11 @@ let rejectAssembly = (state, senderKey, messageId, message) => {
 let addChunk = (state, ~senderKey, chunk, ~final) => {
   let messageId = chunk->TransportMessage.Chunk.messageId
   let chunkBytes = validateOrThrow(state, senderKey, messageId, chunk, ~final)
-  let assemblies = senderAssemblies(state, senderKey)
   if final {
+    let assemblies = switch state.assemblies->Map.get(senderKey) {
+    | Some(assemblies) => assemblies
+    | None => JsError.throwWithMessage("Malformed chunk sequence")
+    }
     let previousAssembly = removeAssembly(state, senderKey, assemblies, messageId)
     let previousChunks = switch previousAssembly {
     | Some(assembly) if assembly.total === chunk->TransportMessage.Chunk.total => assembly.chunks
@@ -160,19 +163,21 @@ let addChunk = (state, ~senderKey, chunk, ~final) => {
     let previousBytes = previousAssembly->Option.mapOr(0, assembly => assembly.bytes)
     if (
       previousBytes + chunkBytes > state.maxMessageBytes ||
-        previousChunks->Array.length + 1 !== chunk->TransportMessage.Chunk.total
+        previousChunks->Map.size + 1 !== chunk->TransportMessage.Chunk.total
     ) {
       JsError.throwWithMessage("Malformed chunk sequence")
     }
-    Some(previousChunks->Array.concat([chunk])->TransportMessage.reassembleChunks)
+    let chunks = []
+    previousChunks->Map.forEach(chunk => chunks->Array.push(chunk)->ignore)
+    chunks->Array.push(chunk)->ignore
+    Some(chunks->TransportMessage.reassembleChunks)
   } else {
+    let assemblies = senderAssemblies(state, senderKey)
     switch assemblies->Map.get(messageId) {
     | Some(assembly) => {
         if (
           assembly.total !== chunk->TransportMessage.Chunk.total ||
-            assembly.chunks->Array.some(existing => {
-              existing->TransportMessage.Chunk.index === chunk->TransportMessage.Chunk.index
-            })
+            assembly.chunks->Map.has(chunk->TransportMessage.Chunk.index)
         ) {
           rejectAssembly(state, senderKey, messageId, "Malformed chunk sequence")
         }
@@ -183,7 +188,7 @@ let addChunk = (state, ~senderKey, chunk, ~final) => {
           rejectAssembly(state, senderKey, messageId, "Chunk allocation exceeds maxMessageBytes")
         }
         clearTimeout(assembly.timeoutId)
-        assembly.chunks = assembly.chunks->Array.concat([chunk])
+        assembly.chunks->Map.set(chunk->TransportMessage.Chunk.index, chunk)
         assembly.bytes = assembly.bytes + chunkBytes
         state.storedBytes = state.storedBytes + chunkBytes
         assembly.timeoutId = setTimeout(() => {
@@ -200,10 +205,12 @@ let addChunk = (state, ~senderKey, chunk, ~final) => {
         let timeoutId = setTimeout(() => {
           removeAssembly(state, senderKey, assemblies, messageId)->ignore
         }, state.timeoutMs)
+        let chunks = Map.make()
+        chunks->Map.set(chunk->TransportMessage.Chunk.index, chunk)
         assemblies->Map.set(
           messageId,
           {
-            chunks: [chunk],
+            chunks,
             total: chunk->TransportMessage.Chunk.total,
             bytes: chunkBytes,
             timeoutId,

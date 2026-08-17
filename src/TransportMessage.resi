@@ -29,4 +29,3 @@ type rec t<'response> =
 let createChunks: ('a, ~size: int=?) => array<t<chunkAck>>
 let reassembleChunks: array<chunk> => string
 let messageId: t<chunkAck> => option<Id.t>
-let isIntermediate: t<chunkAck> => bool

@@ -237,24 +237,28 @@ let cancelActiveRequests = (runtime, id, senderKey) => {
   }
 }
 
+let markRequestSettled = (runtime, id, senderKey) => {
+  let settled = switch runtime.settledRequests->Map.get(senderKey) {
+  | Some(settled) => settled
+  | None => {
+      let settled = Set.make()
+      runtime.settledRequests->Map.set(senderKey, settled)
+      settled
+    }
+  }
+  settled->Set.add(id)
+  setTimeout(() => {
+    settled->Set.delete(id)->ignore
+    if settled->Set.size === 0 {
+      runtime.settledRequests->Map.delete(senderKey)->ignore
+    }
+  }, 0)->ignore
+}
+
 let settleActiveRequest = (runtime, id, controller, senderKey) => {
   if removeActiveRequest(runtime, id, controller, senderKey) {
-    let settled = switch runtime.settledRequests->Map.get(senderKey) {
-    | Some(settled) => settled
-    | None => {
-        let settled = Set.make()
-        runtime.settledRequests->Map.set(senderKey, settled)
-        settled
-      }
-    }
-    settled->Set.add(id)
+    markRequestSettled(runtime, id, senderKey)
     cancelActiveRequests(runtime, id, senderKey)
-    setTimeout(() => {
-      settled->Set.delete(id)->ignore
-      if settled->Set.size === 0 {
-        runtime.settledRequests->Map.delete(senderKey)->ignore
-      }
-    }, 0)->ignore
     true
   } else {
     false
@@ -646,7 +650,10 @@ let dispatchRequestHandlers = (runtime, id, senderKey, message, sender) => {
   switch immediate.contents {
   | Some(Value(value)) => Response.RespondNow(value)
   | Some(Error(message)) => JsError.throwWithMessage(message)
-  | None if deferred->Array.length === 0 => Response.NoResponse
+  | None if deferred->Array.length === 0 => {
+      markRequestSettled(runtime, id, senderKey)
+      Response.NoResponse
+    }
   | None =>
     Response.RespondLater(
       Promise.make((resolve, reject) => {
@@ -732,7 +739,12 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
         | error => sendResponse(runtime, sender, Failure({id, message: exceptionMessage(error)}))
         }
       | Cancel({requestId, assemblyId}) => {
-          requestId->Option.forEach(id => cancelActiveRequests(runtime, id, senderKey))
+          requestId->Option.forEach(id => {
+            if isActiveRequest(runtime, id, senderKey) {
+              cancelActiveRequests(runtime, id, senderKey)
+              markRequestSettled(runtime, id, senderKey)
+            }
+          })
           assemblyId->Option.forEach(messageId =>
             RequestHandler.cancel(runtime.requestHandler, senderKey, messageId)
           )

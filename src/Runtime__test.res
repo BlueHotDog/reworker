@@ -820,6 +820,42 @@ let testInflightCancellation = async () => {
   rejected && started.contents === 1 && aborted.contents === 1
 }
 
+let testCancelledRequestReplayIgnored = async () => {
+  let pair = makeTransportPair()
+  let left = Runtime.make(pair.left)
+  let right = Runtime.make(pair.right)
+  let started = ref(0)
+  let aborted = ref(0)
+  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
+  let controller = AbortController.make()
+  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
+  let request = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow
+  controller->AbortController.abort
+  pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
+  let rejected = await expectRejection(pending, "Request aborted")
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected && started.contents === 1 && aborted.contents === 1
+}
+
+let testNoResponseReplayIgnored = async () => {
+  let pair = makeTransportPair()
+  let left = Runtime.make(pair.left)
+  let right = Runtime.make(pair.right)
+  let handled = ref(0)
+  Runtime.OnMessage.addListener(right, (_message, _sender, _signal) => {
+    handled := handled.contents + 1
+    Response.none
+  })
+  let pending = Runtime.sendMessage(left, NeverRespond)
+  let request = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow
+  pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
+  Runtime.close(left)
+  let rejected = await expectRejection(pending, "Runtime closed")
+  Runtime.close(right)
+  rejected && handled.contents === 1
+}
+
 let testResponseWinsAbortRace = async () => {
   let pair = makeTransportPair()
   let left = Runtime.make(pair.left)
@@ -1240,6 +1276,8 @@ let runTests = async () => {
     ("deferred response after close", testDeferredResponseAfterClose),
     ("pre-aborted request", testPreAbortedRequest),
     ("in-flight request cancellation", testInflightCancellation),
+    ("cancelled request replay ignored", testCancelledRequestReplayIgnored),
+    ("no-response request replay ignored", testNoResponseReplayIgnored),
     ("response wins abort race", testResponseWinsAbortRace),
     ("timeout cancels remote handler", testTimeoutCancelsRemote),
     ("disconnect cancels remote handler", testDisconnectCancelsRemote),

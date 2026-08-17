@@ -66,10 +66,3 @@ let messageId = transportMessage => {
   | IntermediateChunk(chunk) | FinalChunk(chunk) => Some(chunk.messageId)
   }
 }
-
-let isIntermediate = transportMessage => {
-  switch transportMessage {
-  | IntermediateChunk(_) => true
-  | UserMessage(_) | FinalChunk(_) => false
-  }
-}
