@@ -6,9 +6,23 @@
 // This module is internal to Runtime implementation
 // Only expose functions needed by Runtime.res
 
-// Function needed by Runtime.res line 66
+type t
+
+let makeState: (
+  ~timeoutMs: int,
+  ~maxMessageBytes: int,
+  ~maxPendingRequests: int,
+  ~maxChunkBytes: int,
+) => t
+let clear: t => unit
+let cancel: (t, string, Id.t) => unit
+
 let make: (
-  ~userHandler: (Types.message<'a>, 'sender) => Response.t<'a>,
+  t,
+  ~userHandler: (Types.message<'a>, 'sender, option<AbortSignal.t>) => Response.t<'a>,
   TransportMessage.t<'a>,
   'sender,
+  string,
+  Id.t,
+  option<AbortSignal.t>,
 ) => Response.t<'a>

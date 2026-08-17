@@ -8,13 +8,7 @@
 
 // Test helper to create large strings
 let createLargeString = size => {
-  let chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-  let charArray = chars->String.split("")
-  Array.fromInitializer(~length=size, i => {
-    let arrayLength = charArray->Array.length
-    let index = i % arrayLength
-    charArray[index]->Option.getOr("a")
-  })->Array.join("")
+  "a"->String.repeat(size)
 }
 
 // Test: Small messages should not be chunked

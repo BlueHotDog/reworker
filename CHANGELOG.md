@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Replace `Runtime.Make` and window transport functors with independently stateful values created by `Runtime.make`, `WindowTransport.Parent.make`, and `WindowTransport.Child.make`
+- Require explicit parent `connect` and child `listen` startup for window transports
+- Pass an optional `AbortSignal.t` to message handlers and propagate request cancellation to remote handlers
+- Require transport lifecycle, sender identity, generation validation, and resource-limit operations
+- Validate JSON-compatible payloads and chunk oversized requests and responses within configured limits
 - Upgrade the development compiler from ReScript 12 beta to ReScript 12.3
 - Support all stable ReScript 12 releases
 - Restrict the supported package surface to consumer-facing modules
@@ -20,14 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial implementation of type-safe Chrome extension message passing
 - GADT-based message system with compile-time type safety
 - Automatic message chunking for large payloads
-- Framework-agnostic Runtime.Make functor pattern
+- Framework-agnostic value-level runtime API
 - Support for WXT and raw Chrome extension APIs
 - Comprehensive test suite with unit and integration tests
 - Zero runtime dependencies architecture
 
 ### Features
 - **Types.res**: Extensible GADT message type system
-- **Runtime.res**: Generic runtime wrapper with functor pattern
+- **Runtime.res**: Generic value-level runtime with lifecycle and cancellation support
 - **TransportMessage.res**: Internal chunking system (invisible to users)
 - **MessageChunker.res**: Core chunking functionality with size limits
 - **RequestHandler.res**: Automatic chunk reassembly

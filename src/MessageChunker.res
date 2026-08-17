@@ -14,6 +14,36 @@ type textEncoder
 @new external makeTextEncoder: unit => textEncoder = "TextEncoder"
 @send external encode: (textEncoder, string) => Uint8Array.t = "encode"
 
+type seenObjects
+@new external makeSeenObjects: unit => seenObjects = "WeakSet"
+@send external hasSeen: (seenObjects, Obj.t) => bool = "has"
+@send external addSeen: (seenObjects, Obj.t) => unit = "add"
+@send external removeSeen: (seenObjects, Obj.t) => bool = "delete"
+@scope("Array") @val external isArray: Obj.t => bool = "isArray"
+@scope("ArrayBuffer") @val external isArrayBufferView: Obj.t => bool = "isView"
+@scope("Number") @val external isFiniteNumber: Obj.t => bool = "isFinite"
+@scope("Object") @val external objectValues: Obj.t => array<Obj.t> = "values"
+@scope("Object") @val external getPrototypeOf: Obj.t => Nullable.t<Obj.t> = "getPrototypeOf"
+@val external objectPrototype: Obj.t = "Object.prototype"
+type propertyDescriptor
+type propertyGetter
+@val external arrayBufferPrototype: Obj.t = "ArrayBuffer.prototype"
+@scope("Object") @val
+external getOwnPropertyDescriptor: (Obj.t, string) => propertyDescriptor =
+  "getOwnPropertyDescriptor"
+@get external propertyGetter: propertyDescriptor => propertyGetter = "get"
+@send external callPropertyGetter: (propertyGetter, Obj.t) => int = "call"
+
+let isArrayBuffer = value => {
+  try {
+    let getter = getOwnPropertyDescriptor(arrayBufferPrototype, "byteLength")->propertyGetter
+    callPropertyGetter(getter, value)->ignore
+    true
+  } catch {
+  | _ => false
+  }
+}
+
 let decodeBinary = binary => {
   let decoder = makeTextDecoder()
   decoder->decode(binary)
@@ -67,7 +97,75 @@ let splitIntoChunks = (string, ~size=defaultChunkSize, ()) => {
   encodedChunks
 }
 
-let shouldBeChunked = obj => {
-  let messageAsString = obj->JSON.stringifyAny->Option.getOrThrow
-  makeTextEncoder()->encode(messageAsString)->TypedArray.byteLength > maxSize
+let rec validateJsonValue = (value, seen, ~root) => {
+  switch Type.typeof(value) {
+  | #undefined =>
+    if !root {
+      JsError.throwWithMessage("Payload must be JSON-compatible")
+    }
+  | #function | #symbol | #bigint => JsError.throwWithMessage("Payload must be JSON-compatible")
+  | #object => {
+      let nullable: Nullable.t<Obj.t> = Obj.magic(value)
+      switch nullable->Nullable.toOption {
+      | None => ()
+      | Some(object) => {
+          if isArrayBuffer(object) || isArrayBufferView(object) {
+            JsError.throwWithMessage("Payload must be JSON-compatible")
+          }
+          if seen->hasSeen(object) {
+            JsError.throwWithMessage("Payload must be JSON-compatible")
+          }
+          seen->addSeen(object)
+          if !isArray(object) {
+            switch object->getPrototypeOf->Nullable.toOption {
+            | Some(prototype) if prototype === objectPrototype => ()
+            | Some(_) => JsError.throwWithMessage("Payload must be JSON-compatible")
+            | None => ()
+            }
+          }
+          object->objectValues->Array.forEach(item => validateJsonValue(item, seen, ~root=false))
+          seen->removeSeen(object)->ignore
+        }
+      }
+    }
+  | #number =>
+    if !isFiniteNumber(value) {
+      JsError.throwWithMessage("Payload must be JSON-compatible")
+    }
+  | #boolean | #string => ()
+  }
+}
+
+let byteLength = obj => {
+  validateJsonValue(Obj.magic(obj), makeSeenObjects(), ~root=true)
+  switch obj->JSON.stringifyAny {
+  | Some(messageAsString) => makeTextEncoder()->encode(messageAsString)->TypedArray.byteLength
+  | None => 0
+  }
+}
+
+let normalizeJson = value => {
+  validateJsonValue(Obj.magic(value), makeSeenObjects(), ~root=true)
+  switch value->JSON.stringifyAny {
+  | Some(json) => json->JSON.parseOrThrow->Obj.magic
+  | None => Obj.magic(value)
+  }
+}
+
+let stringByteLength = value => makeTextEncoder()->encode(value)->TypedArray.byteLength
+
+let maxChunksPerMessage = 10_000
+
+let configuredChunkCount = (~maxMessageBytes, ~maxChunkBytes) => {
+  let minimumChunkBytes = maxChunkBytes - 3
+  (maxMessageBytes - 1) / minimumChunkBytes + 1
+}
+
+let chunkCountLimit = (~maxMessageBytes, ~maxChunkBytes) => {
+  let configured = configuredChunkCount(~maxMessageBytes, ~maxChunkBytes)
+  configured < maxChunksPerMessage ? configured : maxChunksPerMessage
+}
+
+let shouldBeChunked = (obj, ~size=maxSize) => {
+  obj->byteLength > size
 }

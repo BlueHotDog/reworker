@@ -34,7 +34,8 @@ const closeServer = server => new Promise((resolve, reject) => {
 
 const childHtml = `<!doctype html><script type="module" src="/child.js"></script>`
 const parentHtml = `<!doctype html>
-<iframe id="child" src="http://${host}:${childPort}/child"></iframe>
+<iframe id="child-a" src="http://${host}:${childPort}/child"></iframe>
+<iframe id="child-b" src="http://${host}:${childPort}/child"></iframe>
 <script type="module" src="/parent.js"></script>`
 const wrongOriginHtml = `<!doctype html>
 <iframe id="child" src="http://${host}:${childPort}/child"></iframe>
@@ -109,10 +110,38 @@ try {
 	const page = await browser.newPage()
 	await page.goto(`http://${host}:${parentPort}`)
 	await page.waitForFunction(() => window.reworkerTest !== undefined)
+	const invalidParentOrigin = await page.evaluate(async () => {
+		try { await window.reworkerTest.invalidOrigin("*"); return "resolved" } catch (error) { return String(error) }
+	})
+	assert(invalidParentOrigin.includes("explicit origin"), "parent accepted wildcard origin")
+	const childFrame = page.frames().find(frame => frame.url().includes(`:${childPort}`))
+	assert(childFrame !== undefined, "child frame was not found")
+	await childFrame.waitForFunction(() => window.reworkerChildTest !== undefined)
+	assert((await childFrame.evaluate(() => window.reworkerChildTest.invalidOrigin(""))).includes("explicit origin"), "child accepted empty origin")
 	await page.evaluate(() => window.reworkerTest.connect())
+	assert(JSON.stringify(await page.evaluate(() => window.reworkerTest.lifecycleCounts())) === JSON.stringify([1, 0, 0]), "initial open lifecycle event was incorrect")
+	await page.waitForFunction(() => window.reworkerTest.childOpenNotices() === 2)
 
 	assert(await page.evaluate(() => window.reworkerTest.ping("hello")) === "child:hello", "typed request failed")
 	assert(await page.evaluate(() => window.reworkerTest.reverse("hello")) === "parent:hello", "reverse request failed")
+	const preCancelledError = await page.evaluate(async () => {
+		try { await window.reworkerTest.preCancelled(); return "resolved" } catch (error) { return String(error) }
+	})
+	assert(preCancelledError.includes("Request aborted"), "pre-aborted request did not reject")
+	assert(await page.evaluate(() => window.reworkerTest.cancellationCount()) === 0, "pre-aborted request reached remote handler")
+	assert(await page.evaluate(() => window.reworkerTest.cancellationStartCount()) === 0, "pre-aborted request started remote handler")
+	const cancellationError = await page.evaluate(async () => {
+		try { await window.reworkerTest.cancel(); return "resolved" } catch (error) { return String(error) }
+	})
+	assert(cancellationError.includes("Request aborted"), "in-flight cancellation did not reject")
+	await page.waitForFunction(async () => await window.reworkerTest.cancellationCount() === 1)
+	assert(await page.evaluate(() => window.reworkerTest.cancellationStartCount()) === 1, "in-flight request did not start exactly once")
+	const frameResponses = await page.evaluate(() => Promise.all([
+		window.reworkerTest.pingFrame(0, "first"),
+		window.reworkerTest.pingFrame(1, "second"),
+	]))
+	assert(frameResponses[0] === "child:first", "first iframe runtime failed")
+	assert(frameResponses[1] === "child:second", "second iframe runtime failed")
 
 	await page.evaluate(() => window.reworkerTest.cast("notice"))
 	await page.waitForFunction(async () => await window.reworkerTest.notice() === "notice")
@@ -132,15 +161,21 @@ try {
 	})
 	assert(cloneError !== "resolved", "structured clone failure did not reject")
 	assert(await page.evaluate(() => window.reworkerTest.large()), "chunked request failed")
+	const oversizedError = await page.evaluate(async () => {
+		try { await window.reworkerTest.oversized(); return "resolved" } catch (error) { return String(error) }
+	})
+	assert(oversizedError.includes("maxMessageBytes"), "oversized message was not rejected")
 
 	const reloadError = await page.evaluate(async () => {
-		const pending = window.reworkerTest.timeout()
-		document.querySelector("iframe").src += "?reload=1"
+		const pending = window.reworkerTest.delayedReverse("old-generation")
+		document.querySelector("#child-a").src += "?reload=1"
 		try { await pending; return "resolved" } catch (error) { return String(error) }
 	})
-	assert(reloadError.includes("Iframe reloaded"), "iframe reload did not reject pending request")
+	assert(reloadError.includes("unloading") || reloadError.includes("Iframe reloaded"), "iframe reload did not reject pending request")
 	await page.waitForFunction(() => window.reworkerTest.isOpen())
+	assert(JSON.stringify(await page.evaluate(() => window.reworkerTest.lifecycleCounts())) === JSON.stringify([1, 1, 1]), "reconnect lifecycle events were incorrect")
 	assert(await page.evaluate(() => window.reworkerTest.ping("again")) === "child:again", "reload did not reconnect")
+	assert(await page.evaluate(() => window.reworkerTest.pingFrame(1, "unaffected")) === "child:unaffected", "reload affected another iframe runtime")
 
 	const closeError = await page.evaluate(async () => {
 		const pending = window.reworkerTest.timeout()
@@ -148,6 +183,13 @@ try {
 		try { await pending; return "resolved" } catch (error) { return String(error) }
 	})
 	assert(closeError.includes("Runtime closed"), "teardown did not reject pending request")
+	assert(JSON.stringify(await page.evaluate(() => window.reworkerTest.lifecycleCounts())) === JSON.stringify([1, 2, 1]), "terminal close lifecycle event was incorrect")
+	assert(await page.evaluate(() => window.reworkerTest.firstLoadListenersRemoved()), "load listener was not removed")
+	assert(await page.evaluate(() => window.reworkerTest.pingFrame(1, "still-open")) === "child:still-open", "closing one runtime affected another")
+	const reconnectError = await page.evaluate(async () => {
+		try { await window.reworkerTest.reconnectFirst(); return "resolved" } catch (error) { return String(error) }
+	})
+	assert(reconnectError.includes("closed"), "closed transport reconnected")
 
 	const wrongOriginPage = await browser.newPage()
 	await wrongOriginPage.goto(`http://${host}:${attackerPort}`)

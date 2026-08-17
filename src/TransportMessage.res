@@ -33,20 +33,26 @@ module Chunk = {
   let index = chunk => chunk.index
   let total = chunk => chunk.total
   let isLast = chunk => chunk.index === chunk.total - 1
+  let body = chunk => chunk.body
 }
 
 // Create chunks from a large message string
 // Returns array of transport messages with proper response types
-let createChunks = (message: 'a, ~size=MessageChunker.defaultChunkSize) => {
+let createRawChunks = (message: 'a, ~size) => {
   let messageString = message->JSON.stringifyAny->Option.getOrThrow
   let messageId = Id.make()
   let rawChunks =
     messageString->MessageChunker.splitIntoChunks(~size, ())->Array.map(MessageChunker.decodeBinary)
 
-  rawChunks->Array.mapWithIndex((body, index) => {
-    let chunk = Chunk.make(~messageId, ~index, ~total=rawChunks->Array.length, ~body)
+  rawChunks->Array.mapWithIndex((body, index) =>
+    Chunk.make(~messageId, ~index, ~total=rawChunks->Array.length, ~body)
+  )
+}
 
-    if index === rawChunks->Array.length - 1 {
+let createChunks = (message: 'a, ~size=MessageChunker.defaultChunkSize) => {
+  let chunks = message->createRawChunks(~size)
+  chunks->Array.mapWithIndex((chunk, index) => {
+    if index === chunks->Array.length - 1 {
       FinalChunk(chunk)
     } else {
       IntermediateChunk(chunk)
@@ -58,4 +64,18 @@ let reassembleChunks = (chunks: array<chunk>) => {
   let orderedChunks = chunks->Array.copy
   orderedChunks->Array.sort((left, right) => Int.compare(left.index, right.index))
   orderedChunks->Array.map(chunk => chunk.body)->Array.join("")
+}
+
+let messageId = transportMessage => {
+  switch transportMessage {
+  | UserMessage(_) => None
+  | IntermediateChunk(chunk) | FinalChunk(chunk) => Some(chunk.messageId)
+  }
+}
+
+let isIntermediate = transportMessage => {
+  switch transportMessage {
+  | IntermediateChunk(_) => true
+  | UserMessage(_) | FinalChunk(_) => false
+  }
 }
