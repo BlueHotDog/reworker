@@ -82,16 +82,16 @@ type pendingRequest = {
   mutable responseAssembly: option<responseAssembly>,
 }
 
-type registeredMessageHandler<'sender> = {
-  listener: messageListener<'sender>,
-}
+type registeredMessageHandler<'sender> = (
+  Obj.t,
+  'sender,
+  option<AbortSignal.t>,
+) => Response.t<Obj.t>
 
 type activeRequest = {
   controller: AbortController.t,
   senderKey: string,
 }
-
-type requestDelivery = {mutable remainingHandlers: int}
 
 type t<'sender> = {
   transport: transportCore<'sender>,
@@ -100,11 +100,9 @@ type t<'sender> = {
   mutable responseAssemblyCount: int,
   activeRequests: Map.t<Id.t, array<activeRequest>>,
   settledRequests: Map.t<string, Set.t<Id.t>>,
-  requestDeliveries: Map.t<string, Map.t<Id.t, requestDelivery>>,
-  castDeliveries: Map.t<string, Set.t<Id.t>>,
   requestHandler: RequestHandler.t,
-  handlerToWrapped: HandlerMap.t,
   messageHandlers: ref<array<registeredMessageHandler<'sender>>>,
+  inboundHandler: ref<messageListener<'sender>>,
   openListeners: ref<array<unit => unit>>,
   lifecycleCloseListeners: ref<array<string => unit>>,
   reconnectListeners: ref<array<unit => unit>>,
@@ -224,10 +222,6 @@ let clearPendingRequests = (runtime, reason) => {
   runtime.activeRequests->Map.clear
   runtime.settledRequests->Map.forEach(requests => requests->Set.clear)
   runtime.settledRequests->Map.clear
-  runtime.requestDeliveries->Map.forEach(deliveries => deliveries->Map.clear)
-  runtime.requestDeliveries->Map.clear
-  runtime.castDeliveries->Map.forEach(deliveries => deliveries->Set.clear)
-  runtime.castDeliveries->Map.clear
   runtime.requestHandler->RequestHandler.clear
 }
 
@@ -432,16 +426,14 @@ let make:
       responseAssemblyCount: 0,
       activeRequests: Map.make(),
       settledRequests: Map.make(),
-      requestDeliveries: Map.make(),
-      castDeliveries: Map.make(),
       requestHandler: RequestHandler.makeState(
         ~timeoutMs=transport.requestTimeoutMs,
         ~maxMessageBytes=transport.maxMessageBytes,
         ~maxPendingRequests=transport.maxPendingRequests,
         ~maxChunkBytes=transport.maxChunkBytes,
       ),
-      handlerToWrapped: HandlerMap.make(),
       messageHandlers: ref([]),
+      inboundHandler: ref((_message, _sender) => ()),
       openListeners: ref([]),
       lifecycleCloseListeners: ref([]),
       reconnectListeners: ref([]),
@@ -485,7 +477,7 @@ let make:
             } else {
               rejectInvalidResponse(runtime, id)
             }
-          | Request(_) | Cancel(_) | Cast(_) => ()
+          | Request(_) | Cancel(_) | Cast(_) => runtime.inboundHandler.contents(message, sender)
           }
         } catch {
         | _ => ()
@@ -725,63 +717,6 @@ let isActiveRequest = (runtime, id, senderKey) => {
   )
 }
 
-let allowRequestDelivery = (runtime, id, senderKey) => {
-  let deliveries = switch runtime.requestDeliveries->Map.get(senderKey) {
-  | Some(deliveries) => deliveries
-  | None => {
-      let deliveries = Map.make()
-      runtime.requestDeliveries->Map.set(senderKey, deliveries)
-      deliveries
-    }
-  }
-  switch deliveries->Map.get(id) {
-  | Some(delivery) if delivery.remainingHandlers > 0 => {
-      delivery.remainingHandlers = delivery.remainingHandlers - 1
-      true
-    }
-  | Some(_) => false
-  | None if isActiveRequest(runtime, id, senderKey) => false
-  | None => {
-      deliveries->Map.set(
-        id,
-        {
-          remainingHandlers: runtime.messageHandlers.contents->Array.length - 1,
-        },
-      )
-      setTimeout(() => {
-        deliveries->Map.delete(id)->ignore
-        if deliveries->Map.size === 0 {
-          runtime.requestDeliveries->Map.delete(senderKey)->ignore
-        }
-      }, 0)->ignore
-      true
-    }
-  }
-}
-
-let isFirstCastDelivery = (runtime, id, senderKey) => {
-  let deliveries = switch runtime.castDeliveries->Map.get(senderKey) {
-  | Some(deliveries) => deliveries
-  | None => {
-      let deliveries = Set.make()
-      runtime.castDeliveries->Map.set(senderKey, deliveries)
-      deliveries
-    }
-  }
-  if deliveries->Set.has(id) {
-    false
-  } else {
-    deliveries->Set.add(id)
-    setTimeout(() => {
-      deliveries->Set.delete(id)->ignore
-      if deliveries->Set.size === 0 {
-        runtime.castDeliveries->Map.delete(senderKey)->ignore
-      }
-    }, 0)->ignore
-    true
-  }
-}
-
 let cast:
   type sender response. (t<sender>, Types.message<response>) => unit =
   (runtime, message) => {
@@ -801,6 +736,158 @@ let cast:
     }
   }
 
+type deferredHandlerResponse = {
+  promise: Promise.t<Obj.t>,
+  controller: AbortController.t,
+}
+
+type immediateHandlerResponse =
+  | Value(Obj.t)
+  | Error(string)
+
+let dispatchRequestHandlers = (runtime, id, senderKey, message, sender) => {
+  let deferred = []
+  let immediate = ref(None)
+  runtime.messageHandlers.contents->Array.forEach(registered => {
+    if immediate.contents->Option.isNone {
+      let controller = AbortController.make()
+      addActiveRequest(runtime, id, controller, senderKey)
+      try {
+        switch registered(message, sender, Some(controller->AbortController.signal)) {
+        | Response.RespondNow(value) =>
+          if settleActiveRequest(runtime, id, controller, senderKey) {
+            immediate := Some(Value(value))
+          }
+        | Response.RespondLater(promise) => deferred->Array.push({promise, controller})->ignore
+        | Response.NoResponse => removeActiveRequest(runtime, id, controller, senderKey)->ignore
+        }
+      } catch {
+      | error =>
+        if settleActiveRequest(runtime, id, controller, senderKey) {
+          immediate := Some(Error(exceptionMessage(error)))
+        }
+      }
+    }
+  })
+
+  switch immediate.contents {
+  | Some(Value(value)) => Response.RespondNow(value)
+  | Some(Error(message)) => JsError.throwWithMessage(message)
+  | None if deferred->Array.length === 0 => Response.NoResponse
+  | None =>
+    Response.RespondLater(
+      Promise.make((resolve, reject) => {
+        deferred->Array.forEach(response => {
+          response.promise
+          ->Promise.thenResolve(
+            value => {
+              if settleActiveRequest(runtime, id, response.controller, senderKey) {
+                resolve(value)
+              }
+            },
+          )
+          ->Promise.catch(
+            error => {
+              if settleActiveRequest(runtime, id, response.controller, senderKey) {
+                reject(error)
+              }
+              Promise.resolve()
+            },
+          )
+          ->ignore
+        })
+      }),
+    )
+  }
+}
+
+let dispatchCastHandlers = (runtime, message, sender) => {
+  runtime.messageHandlers.contents->Array.forEach(registered => {
+    try {
+      switch registered(message, sender, None) {
+      | Response.RespondLater(promise) =>
+        promise->Promise.thenResolve(_ => ())->Promise.catch(_ => Promise.resolve())->ignore
+      | Response.RespondNow(_) | Response.NoResponse => ()
+      }
+    } catch {
+    | _ => ()
+    }
+  })
+  Response.none
+}
+
+let handleInboundProtocol = (runtime, rawMessage, sender) => {
+  if runtime.transport.isCurrentSender(sender) {
+    try {
+      let senderKey = runtime.transport.senderKey(sender)
+      switch (Obj.magic(rawMessage): protocolMessage) {
+      | Request({id, message: _}) if isRequestSettled(runtime, id, senderKey) => ()
+      | Request({id, message: _}) if isActiveRequest(runtime, id, senderKey) =>
+        sendResponse(runtime, sender, Failure({id, message: "Duplicate request"}))
+      | Request({id, message: _})
+        if inboundRequestCount(runtime, senderKey) >= runtime.transport.maxPendingRequests =>
+        sendResponse(runtime, sender, Failure({id, message: "Too many pending requests"}))
+      | Request({id, message}) =>
+        try {
+          switch RequestHandler.make(
+            runtime.requestHandler,
+            ~userHandler=(message, sender, _signal) =>
+              dispatchRequestHandlers(
+                runtime,
+                id,
+                senderKey,
+                Obj.magic(message),
+                sender,
+              )->Obj.magic,
+            Obj.magic(message),
+            sender,
+            senderKey,
+            id,
+            None,
+          ) {
+          | Response.RespondNow(value) => sendResponse(runtime, sender, Success({id, value}))
+          | Response.RespondLater(promise) =>
+            promise
+            ->Promise.thenResolve(value => sendResponse(runtime, sender, Success({id, value})))
+            ->Promise.catch(error => {
+              sendResponse(runtime, sender, Failure({id, message: exceptionMessage(error)}))
+              Promise.resolve()
+            })
+            ->ignore
+          | Response.NoResponse => ()
+          }
+        } catch {
+        | error => sendResponse(runtime, sender, Failure({id, message: exceptionMessage(error)}))
+        }
+      | Cancel({requestId, assemblyId}) => {
+          requestId->Option.forEach(id => cancelActiveRequests(runtime, id, senderKey))
+          assemblyId->Option.forEach(messageId =>
+            RequestHandler.cancel(runtime.requestHandler, senderKey, messageId)
+          )
+        }
+      | Cast({id, message}) =>
+        try {
+          RequestHandler.make(
+            runtime.requestHandler,
+            ~userHandler=(message, sender, _signal) =>
+              dispatchCastHandlers(runtime, Obj.magic(message), sender)->Obj.magic,
+            Obj.magic(message),
+            sender,
+            senderKey,
+            id,
+            None,
+          )->ignore
+        } catch {
+        | _ => ()
+        }
+      | Success(_) | SuccessChunk(_) | Failure(_) => ()
+      }
+    } catch {
+    | _ => ()
+    }
+  }
+}
+
 module OnMessage = {
   let addListener:
     type sender response. (
@@ -811,123 +898,11 @@ module OnMessage = {
       if runtime.closed {
         JsError.throwWithMessage("Runtime is closed")
       }
-      switch HandlerMap.get(runtime.handlerToWrapped, userHandler) {
-      | Some(_) => ()
-      | None => {
-          let messageHandler = (protocolMessage, sender) => {
-            if runtime.transport.isCurrentSender(sender) {
-              try {
-                let senderKey = runtime.transport.senderKey(sender)
-                let handleTransportMessage = (transportMessage, deliveryId, signal) => {
-                  RequestHandler.make(
-                    runtime.requestHandler,
-                    ~userHandler,
-                    transportMessage,
-                    sender,
-                    senderKey,
-                    deliveryId,
-                    signal,
-                  )
-                }
-
-                switch (Obj.magic(protocolMessage): protocolMessage) {
-                | Request({id, message: _}) if !allowRequestDelivery(runtime, id, senderKey) =>
-                  sendResponse(
-                    runtime,
-                    sender,
-                    (Failure({id, message: "Duplicate request"}): protocolMessage),
-                  )
-                | Request({id, message: _}) if isRequestSettled(runtime, id, senderKey) => ()
-                | Request({id, message: _})
-                  if !isActiveRequest(runtime, id, senderKey) &&
-                  inboundRequestCount(runtime, senderKey) >= runtime.transport.maxPendingRequests =>
-                  sendResponse(
-                    runtime,
-                    sender,
-                    (Failure({id, message: "Too many pending requests"}): protocolMessage),
-                  )
-                | Request({id, message}) => {
-                    let controller = AbortController.make()
-                    addActiveRequest(runtime, id, controller, senderKey)
-                    let signal = controller->AbortController.signal
-                    try {
-                      switch handleTransportMessage(Obj.magic(message), id, Some(signal)) {
-                      | Response.RespondNow(value) =>
-                        if settleActiveRequest(runtime, id, controller, senderKey) {
-                          sendResponse(runtime, sender, Success({id, value: Obj.magic(value)}))
-                        }
-                      | Response.RespondLater(promise) =>
-                        promise
-                        ->Promise.thenResolve(value => {
-                          if settleActiveRequest(runtime, id, controller, senderKey) {
-                            sendResponse(runtime, sender, Success({id, value: Obj.magic(value)}))
-                          }
-                        })
-                        ->Promise.catch(error => {
-                          if settleActiveRequest(runtime, id, controller, senderKey) {
-                            sendResponse(
-                              runtime,
-                              sender,
-                              (Failure({id, message: exceptionMessage(error)}): protocolMessage),
-                            )
-                          }
-                          Promise.resolve()
-                        })
-                        ->ignore
-                      | Response.NoResponse =>
-                        removeActiveRequest(runtime, id, controller, senderKey)->ignore
-                      }
-                    } catch {
-                    | error =>
-                      if settleActiveRequest(runtime, id, controller, senderKey) {
-                        sendResponse(
-                          runtime,
-                          sender,
-                          (Failure({id, message: exceptionMessage(error)}): protocolMessage),
-                        )
-                      }
-                    }
-                  }
-                | Cancel({requestId, assemblyId}) => {
-                    switch requestId {
-                    | Some(id) => cancelActiveRequests(runtime, id, senderKey)
-                    | None => ()
-                    }
-                    switch assemblyId {
-                    | Some(messageId) =>
-                      RequestHandler.cancel(runtime.requestHandler, senderKey, messageId)
-                    | None => ()
-                    }
-                  }
-                | Cast({id, message}) =>
-                  let isIntermediate = TransportMessage.isIntermediate(Obj.magic(message))
-                  if !isIntermediate || isFirstCastDelivery(runtime, id, senderKey) {
-                    try {
-                      switch handleTransportMessage(Obj.magic(message), id, None) {
-                      | Response.RespondLater(promise) =>
-                        promise
-                        ->Promise.thenResolve(_ => ())
-                        ->Promise.catch(_ => Promise.resolve())
-                        ->ignore
-                      | Response.RespondNow(_) | Response.NoResponse => ()
-                      }
-                    } catch {
-                    | _ => ()
-                    }
-                  }
-                | Success(_) | SuccessChunk(_) | Failure(_) => ()
-                }
-              } catch {
-              | _ => ()
-              }
-            }
-          }
-
-          HandlerMap.set(runtime.handlerToWrapped, userHandler, messageHandler)
-          runtime.messageHandlers :=
-            runtime.messageHandlers.contents->Array.concat([{listener: messageHandler}])
-          runtime.transport.addMessageListener(messageHandler)
-        }
+      let handler = Obj.magic(userHandler)
+      if !(runtime.messageHandlers.contents->Array.some(registered => registered === handler)) {
+        runtime.messageHandlers := runtime.messageHandlers.contents->Array.concat([handler])
+        runtime.inboundHandler :=
+          ((message, sender) => handleInboundProtocol(runtime, message, sender))
       }
     }
 
@@ -937,20 +912,14 @@ module OnMessage = {
       (Types.message<response>, sender, option<AbortSignal.t>) => Response.t<response>,
     ) => unit =
     (runtime, userHandler) => {
-      switch HandlerMap.get(runtime.handlerToWrapped, userHandler) {
-      | Some(wrappedHandler) => {
-          runtime.transport.removeMessageListener(wrappedHandler)
-          runtime.messageHandlers :=
-            runtime.messageHandlers.contents->Array.filter(handler => {
-              if handler.listener === wrappedHandler {
-                false
-              } else {
-                true
-              }
-            })
-          HandlerMap.delete(runtime.handlerToWrapped, userHandler)
-        }
-      | None => Console.warn("Handler not found - was it already removed or never added?")
+      let handler = Obj.magic(userHandler)
+      let previousLength = runtime.messageHandlers.contents->Array.length
+      runtime.messageHandlers :=
+        runtime.messageHandlers.contents->Array.filter(registered => registered !== handler)
+      if runtime.messageHandlers.contents->Array.length === previousLength {
+        Console.warn("Handler not found - was it already removed or never added?")
+      } else if runtime.messageHandlers.contents->Array.length === 0 {
+        runtime.inboundHandler := ((_message, _sender) => ())
       }
     }
 }
@@ -978,11 +947,9 @@ let close = runtime => {
     clearPendingRequests(runtime, "Runtime closed")
     let closeListeners = runtime.connectionOpen ? runtime.lifecycleCloseListeners.contents : []
     runtime.connectionOpen = false
-    runtime.messageHandlers.contents->Array.forEach(handler => {
-      runtime.transport.removeMessageListener(handler.listener)
-    })
     runtime.requestHandler->RequestHandler.clear
     runtime.messageHandlers := []
+    runtime.inboundHandler := ((_message, _sender) => ())
     switch runtime.responseHandler {
     | Some(handler) => runtime.transport.removeMessageListener(handler)
     | None => ()
