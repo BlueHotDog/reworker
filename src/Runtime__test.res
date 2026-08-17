@@ -826,12 +826,38 @@ let testCancelledRequestReplayIgnored = async () => {
   let right = Runtime.make(pair.right)
   let started = ref(0)
   let aborted = ref(0)
-  Runtime.OnMessage.addListener(right, makeCancellableHandler(started, aborted))
+  let request = ref(None)
+  Runtime.OnMessage.addListener(right, (message, _sender, signal) => {
+    switch message {
+    | Cancellable => {
+        started := started.contents + 1
+        signal->Option.forEach(signal =>
+          AbortSignal.addEventListener(
+            signal,
+            "abort",
+            () => {
+              aborted := aborted.contents + 1
+              request.contents->Option.forEach(
+                request =>
+                  pair.rightEndpoint.messageListeners.contents->Array.forEach(
+                    listener => listener(request, ()),
+                  ),
+              )
+            },
+          )
+        )
+        Response.later(Promise.make((_resolve, _reject) => ()))
+      }
+    | _ => Response.none
+    }
+  })
   let controller = AbortController.make()
   let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
-  let request = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow
+  request := pair.leftEndpoint.lastPosted.contents
   controller->AbortController.abort
-  pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
+  request.contents->Option.forEach(request =>
+    pair.rightEndpoint.messageListeners.contents->Array.forEach(listener => listener(request, ()))
+  )
   let rejected = await expectRejection(pending, "Request aborted")
   Runtime.close(left)
   Runtime.close(right)

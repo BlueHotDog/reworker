@@ -741,8 +741,8 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
       | Cancel({requestId, assemblyId}) => {
           requestId->Option.forEach(id => {
             if isActiveRequest(runtime, id, senderKey) {
-              cancelActiveRequests(runtime, id, senderKey)
               markRequestSettled(runtime, id, senderKey)
+              cancelActiveRequests(runtime, id, senderKey)
             }
           })
           assemblyId->Option.forEach(messageId =>
