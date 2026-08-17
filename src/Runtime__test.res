@@ -562,18 +562,20 @@ let testMalformedChunkLimits = () => {
 
 let testListenerRemoval = () => {
   let pair = makeTransportPair()
-  let runtime = Runtime.make(pair.left)
-  let handler = (message, _sender, _signal) => {
-    switch message {
-    | Echo(value) => Response.now(value)
-    | _ => Response.none
-    }
+  let left = Runtime.make(pair.left)
+  let right = Runtime.make(pair.right)
+  let handled = ref(0)
+  let handler = (_message, _sender, _signal) => {
+    handled := handled.contents + 1
+    Response.none
   }
-  Runtime.OnMessage.addListener(runtime, handler)
-  Runtime.OnMessage.addListener(runtime, handler)
-  Runtime.OnMessage.removeListener(runtime, handler)
-  Runtime.close(runtime)
-  true
+  Runtime.OnMessage.addListener(right, handler)
+  Runtime.OnMessage.addListener(right, handler)
+  Runtime.OnMessage.removeListener(right, handler)
+  Runtime.cast(left, Notice("removed"))
+  Runtime.close(left)
+  Runtime.close(right)
+  handled.contents === 0
 }
 
 let testSecondHandlerRejected = () => {
@@ -802,6 +804,24 @@ let testInflightCancellation = async () => {
   let controller = AbortController.make()
   let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
   controller->AbortController.abort
+  controller->AbortController.abort
+  let rejected = await expectRejection(pending, "Request aborted")
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected && started.contents === 1 && aborted.contents === 1
+}
+
+let testRemovedHandlerStillCancelsActiveRequest = async () => {
+  let pair = makeTransportPair()
+  let left = Runtime.make(pair.left)
+  let right = Runtime.make(pair.right)
+  let started = ref(0)
+  let aborted = ref(0)
+  let handler = makeCancellableHandler(started, aborted)
+  Runtime.OnMessage.addListener(right, handler)
+  let controller = AbortController.make()
+  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
+  Runtime.OnMessage.removeListener(right, handler)
   controller->AbortController.abort
   let rejected = await expectRejection(pending, "Request aborted")
   Runtime.close(left)
@@ -1233,6 +1253,7 @@ let runTests = async () => {
     ("deferred response after close", testDeferredResponseAfterClose),
     ("pre-aborted request", testPreAbortedRequest),
     ("in-flight request cancellation", testInflightCancellation),
+    ("removed handler cancels active request", testRemovedHandlerStillCancelsActiveRequest),
     ("cancelled request replay ignored", testCancelledRequestReplayIgnored),
     ("no-response request replay ignored", testNoResponseReplayIgnored),
     ("response wins abort race", testResponseWinsAbortRace),

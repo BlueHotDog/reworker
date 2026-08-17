@@ -258,7 +258,6 @@ let markRequestSettled = (runtime, id, senderKey) => {
 let settleActiveRequest = (runtime, id, controller, senderKey) => {
   if removeActiveRequest(runtime, id, controller, senderKey) {
     markRequestSettled(runtime, id, senderKey)
-    cancelActiveRequests(runtime, id, senderKey)
     true
   } else {
     false
@@ -781,10 +780,7 @@ module OnMessage = {
     (runtime, userHandler) => {
       let handler = Obj.magic(userHandler)
       switch runtime.messageHandler.contents {
-      | Some(current) if current === handler => {
-          runtime.messageHandler := None
-          runtime.inboundHandler := ((_message, _sender) => ())
-        }
+      | Some(current) if current === handler => runtime.messageHandler := None
       | Some(_) | None => Console.warn("Handler not found - was it already removed or never added?")
       }
     }
@@ -815,7 +811,6 @@ let close = runtime => {
     runtime.connectionOpen = false
     runtime.requestHandler->RequestHandler.clear
     runtime.messageHandler := None
-    runtime.inboundHandler := ((_message, _sender) => ())
     switch runtime.responseHandler {
     | Some(handler) => runtime.transport.removeMessageListener(handler)
     | None => ()
