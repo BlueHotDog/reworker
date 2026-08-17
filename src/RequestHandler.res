@@ -147,6 +147,76 @@ let rejectAssembly = (state, senderKey, messageId, message) => {
   JsError.throwWithMessage(message)
 }
 
+let addChunk = (state, ~senderKey, chunk, ~final) => {
+  let messageId = chunk->TransportMessage.Chunk.messageId
+  let chunkBytes = validateOrThrow(state, senderKey, messageId, chunk, ~final)
+  let assemblies = senderAssemblies(state, senderKey)
+  if final {
+    let previousAssembly = removeAssembly(state, senderKey, assemblies, messageId)
+    let previousChunks = switch previousAssembly {
+    | Some(assembly) if assembly.total === chunk->TransportMessage.Chunk.total => assembly.chunks
+    | Some(_) | None => JsError.throwWithMessage("Malformed chunk sequence")
+    }
+    let previousBytes = previousAssembly->Option.mapOr(0, assembly => assembly.bytes)
+    if (
+      previousBytes + chunkBytes > state.maxMessageBytes ||
+        previousChunks->Array.length + 1 !== chunk->TransportMessage.Chunk.total
+    ) {
+      JsError.throwWithMessage("Malformed chunk sequence")
+    }
+    Some(previousChunks->Array.concat([chunk])->TransportMessage.reassembleChunks)
+  } else {
+    switch assemblies->Map.get(messageId) {
+    | Some(assembly) => {
+        if (
+          assembly.total !== chunk->TransportMessage.Chunk.total ||
+            assembly.chunks->Array.some(existing => {
+              existing->TransportMessage.Chunk.index === chunk->TransportMessage.Chunk.index
+            })
+        ) {
+          rejectAssembly(state, senderKey, messageId, "Malformed chunk sequence")
+        }
+        if assembly.bytes + chunkBytes > state.maxMessageBytes {
+          rejectAssembly(state, senderKey, messageId, "Message exceeds maxMessageBytes")
+        }
+        if state.storedBytes + chunkBytes > state.maxMessageBytes {
+          rejectAssembly(state, senderKey, messageId, "Chunk allocation exceeds maxMessageBytes")
+        }
+        clearTimeout(assembly.timeoutId)
+        assembly.chunks = assembly.chunks->Array.concat([chunk])
+        assembly.bytes = assembly.bytes + chunkBytes
+        state.storedBytes = state.storedBytes + chunkBytes
+        assembly.timeoutId = setTimeout(() => {
+          removeAssembly(state, senderKey, assemblies, messageId)->ignore
+        }, state.timeoutMs)
+      }
+    | None => {
+        if state.assemblyCount >= state.maxPendingRequests {
+          rejectAssembly(state, senderKey, messageId, "Too many pending chunk assemblies")
+        }
+        if state.storedBytes + chunkBytes > state.maxMessageBytes {
+          rejectAssembly(state, senderKey, messageId, "Chunk allocation exceeds maxMessageBytes")
+        }
+        let timeoutId = setTimeout(() => {
+          removeAssembly(state, senderKey, assemblies, messageId)->ignore
+        }, state.timeoutMs)
+        assemblies->Map.set(
+          messageId,
+          {
+            chunks: [chunk],
+            total: chunk->TransportMessage.Chunk.total,
+            bytes: chunkBytes,
+            timeoutId,
+          },
+        )
+        state.storedBytes = state.storedBytes + chunkBytes
+        state.assemblyCount = state.assemblyCount + 1
+      }
+    }
+    None
+  }
+}
+
 let make:
   type a. (
     t,
@@ -156,101 +226,21 @@ let make:
     string,
     option<AbortSignal.t>,
   ) => Response.t<a> =
-  (state, ~userHandler, transportMessage, sender, senderKey, signal) => {
+  (state, ~userHandler, transportMessage, sender, senderKey, signal) =>
     switch transportMessage {
-    // Direct user message - forward to user handler
     | TransportMessage.UserMessage(userMessage) => {
         if userMessage->MessageChunker.byteLength > state.maxMessageBytes {
           JsError.throwWithMessage("Message exceeds maxMessageBytes")
         }
         userHandler(userMessage, sender, signal)
       }
-
-    // Intermediate chunk - store and acknowledge
-    | TransportMessage.IntermediateChunk(chunk) =>
-      let messageId = chunk->TransportMessage.Chunk.messageId
-      let chunkBytes = validateOrThrow(state, senderKey, messageId, chunk, ~final=false)
-      let assemblies = senderAssemblies(state, senderKey)
-      switch assemblies->Map.get(messageId) {
-      | Some(assembly) =>
-        switch assembly.chunks->Array.find(existing => {
-          existing->TransportMessage.Chunk.index === chunk->TransportMessage.Chunk.index
-        }) {
-        | Some(_) => rejectAssembly(state, senderKey, messageId, "Malformed chunk sequence")
-        | None => {
-            if assembly.total !== chunk->TransportMessage.Chunk.total {
-              rejectAssembly(state, senderKey, messageId, "Malformed chunk sequence")
-            }
-            if assembly.bytes + chunkBytes > state.maxMessageBytes {
-              rejectAssembly(state, senderKey, messageId, "Message exceeds maxMessageBytes")
-            }
-            if state.storedBytes + chunkBytes > state.maxMessageBytes {
-              rejectAssembly(
-                state,
-                senderKey,
-                messageId,
-                "Chunk allocation exceeds maxMessageBytes",
-              )
-            }
-            clearTimeout(assembly.timeoutId)
-            assembly.chunks = assembly.chunks->Array.concat([chunk])
-            assembly.bytes = assembly.bytes + chunkBytes
-            state.storedBytes = state.storedBytes + chunkBytes
-            assembly.timeoutId = setTimeout(() => {
-              removeAssembly(state, senderKey, assemblies, messageId)->ignore
-            }, state.timeoutMs)
-          }
-        }
-      | None => {
-          if state.assemblyCount >= state.maxPendingRequests {
-            rejectAssembly(state, senderKey, messageId, "Too many pending chunk assemblies")
-          }
-          if state.storedBytes + chunkBytes > state.maxMessageBytes {
-            rejectAssembly(state, senderKey, messageId, "Chunk allocation exceeds maxMessageBytes")
-          }
-          let timeoutId = setTimeout(() => {
-            removeAssembly(state, senderKey, assemblies, messageId)->ignore
-          }, state.timeoutMs)
-          assemblies->Map.set(
-            messageId,
-            {
-              chunks: [chunk],
-              total: chunk->TransportMessage.Chunk.total,
-              bytes: chunkBytes,
-              timeoutId,
-            },
-          )
-          state.storedBytes = state.storedBytes + chunkBytes
-          state.assemblyCount = state.assemblyCount + 1
-        }
+    | TransportMessage.IntermediateChunk(chunk) => {
+        addChunk(state, ~senderKey, chunk, ~final=false)->ignore
+        Response.RespondNow(TransportMessage.ChunkAck(chunk->TransportMessage.Chunk.messageId))
       }
-
-      // Return chunk acknowledgment immediately
-      let chunkAck = TransportMessage.ChunkAck(messageId)
-      Response.RespondNow(chunkAck)
-
     | TransportMessage.FinalChunk(chunk) =>
-      // Final chunk - reassemble and forward to user handler
-      let messageId = chunk->TransportMessage.Chunk.messageId
-      let chunkBytes = validateOrThrow(state, senderKey, messageId, chunk, ~final=true)
-      let assemblies = senderAssemblies(state, senderKey)
-      let previousAssembly = removeAssembly(state, senderKey, assemblies, messageId)
-      let previousChunks = switch previousAssembly {
-      | Some(assembly) if assembly.total === chunk->TransportMessage.Chunk.total => assembly.chunks
-      | Some(_) | None => JsError.throwWithMessage("Malformed chunk sequence")
+      switch addChunk(state, ~senderKey, chunk, ~final=true) {
+      | Some(message) => userHandler(message->JSON.parseOrThrow->Obj.magic, sender, signal)
+      | None => JsError.throwWithMessage("Malformed chunk sequence")
       }
-      let previousBytes = previousAssembly->Option.mapOr(0, assembly => assembly.bytes)
-      if (
-        previousBytes + chunkBytes > state.maxMessageBytes ||
-          previousChunks->Array.length + 1 !== chunk->TransportMessage.Chunk.total
-      ) {
-        JsError.throwWithMessage("Malformed chunk sequence")
-      }
-      let originalMessage =
-        previousChunks
-        ->Array.concat([chunk])
-        ->TransportMessage.reassembleChunks
-        ->JSON.parseOrThrow
-      userHandler(originalMessage->Obj.magic, sender, signal)
     }
-  }

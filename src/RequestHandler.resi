@@ -16,6 +16,7 @@ let makeState: (
 ) => t
 let clear: t => unit
 let cancel: (t, string, Id.t) => unit
+let addChunk: (t, ~senderKey: string, TransportMessage.chunk, ~final: bool) => option<string>
 
 let make: (
   t,

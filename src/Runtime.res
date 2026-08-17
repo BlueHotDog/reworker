@@ -63,10 +63,8 @@ type protocolMessage =
 @scope("Object") @val external hasOwn: (Obj.t, string) => bool = "hasOwn"
 
 type responseAssembly = {
+  senderKey: string,
   messageId: Id.t,
-  total: int,
-  mutable bytes: int,
-  chunks: Map.t<int, TransportMessage.chunk>,
 }
 
 type pendingRequest = {
@@ -91,8 +89,6 @@ type activeRequest = {
 type t<'sender> = {
   transport: transportCore<'sender>,
   pendingRequests: Map.t<Id.t, pendingRequest>,
-  mutable responseStoredBytes: int,
-  mutable responseAssemblyCount: int,
   activeRequests: Map.t<Id.t, array<activeRequest>>,
   settledRequests: Map.t<string, Set.t<Id.t>>,
   requestHandler: RequestHandler.t,
@@ -167,10 +163,8 @@ let takePendingRequest = (runtime, id) => {
       clearTimeout(pending.timeoutId)
       pending.removeAbortListener()
       switch pending.responseAssembly {
-      | Some(assembly) => {
-          runtime.responseStoredBytes = runtime.responseStoredBytes - assembly.bytes
-          runtime.responseAssemblyCount = runtime.responseAssemblyCount - 1
-        }
+      | Some(assembly) =>
+        RequestHandler.cancel(runtime.requestHandler, assembly.senderKey, assembly.messageId)
       | None => ()
       }
       runtime.pendingRequests->Map.delete(id)->ignore
@@ -209,8 +203,6 @@ let clearPendingRequests = (runtime, reason) => {
     pending.reject(JsError.make(reason))
   })
   runtime.pendingRequests->Map.clear
-  runtime.responseStoredBytes = 0
-  runtime.responseAssemblyCount = 0
   runtime.activeRequests->Map.forEach(requests => {
     requests->Array.forEach(request => request.controller->AbortController.abort)
   })
@@ -296,73 +288,37 @@ let rejectInvalidResponse = (runtime, id) => {
   rejectPendingRequest(runtime, id, "Invalid response payload")
 }
 
-let resolveResponseChunk = (runtime, id, chunk) => {
+let resolveResponseChunk = (runtime, id, chunk, sender) => {
   switch runtime.pendingRequests->Map.get(id) {
   | None => ()
   | Some(pending) =>
     try {
       let messageId = chunk->TransportMessage.Chunk.messageId
-      let index = chunk->TransportMessage.Chunk.index
-      let total = chunk->TransportMessage.Chunk.total
-      let body = chunk->TransportMessage.Chunk.body
-      let bodyBytes = body->MessageChunker.stringByteLength
-      let maxChunks = MessageChunker.chunkCountLimit(
-        ~maxMessageBytes=runtime.transport.maxMessageBytes,
-        ~maxChunkBytes=runtime.transport.maxChunkBytes,
-      )
-      if (
-        Type.typeof(Obj.magic(messageId)) !== #string ||
-        messageId->Id.toString === "" ||
-        !isSafeInteger(Obj.magic(index)) ||
-        !isSafeInteger(Obj.magic(total)) ||
-        Type.typeof(Obj.magic(body)) !== #string ||
-        body === "" ||
-        total <= 1 ||
-        total > maxChunks ||
-        index < 0 ||
-        index >= total ||
-        bodyBytes > runtime.transport.maxChunkBytes ||
-        (index < total - 1 && bodyBytes < runtime.transport.maxChunkBytes - 3)
-      ) {
+      let senderKey = `response:${runtime.transport.senderKey(sender)}:${id->Id.toString}`
+      switch pending.responseAssembly {
+      | Some(assembly) if assembly.senderKey !== senderKey || assembly.messageId !== messageId =>
         rejectInvalidResponse(runtime, id)
-      } else {
-        let assembly = switch pending.responseAssembly {
-        | Some(assembly) => assembly
-        | None => {
-            if runtime.responseAssemblyCount >= runtime.transport.maxPendingRequests {
-              JsError.throwWithMessage("Too many pending response assemblies")
-            }
-            let assembly = {messageId, total, bytes: 0, chunks: Map.make()}
-            pending.responseAssembly = Some(assembly)
-            runtime.responseAssemblyCount = runtime.responseAssemblyCount + 1
-            assembly
-          }
-        }
-        if (
-          assembly.messageId !== messageId ||
-          assembly.total !== total ||
-          assembly.chunks->Map.has(index) ||
-          assembly.bytes + bodyBytes > runtime.transport.maxMessageBytes ||
-          runtime.responseStoredBytes + bodyBytes > runtime.transport.maxMessageBytes
-        ) {
-          rejectInvalidResponse(runtime, id)
-        } else {
-          assembly.chunks->Map.set(index, chunk)
-          assembly.bytes = assembly.bytes + bodyBytes
-          runtime.responseStoredBytes = runtime.responseStoredBytes + bodyBytes
-          if assembly.chunks->Map.size === total {
-            let chunks = []
-            assembly.chunks->Map.forEach(chunk => chunks->Array.push(chunk)->ignore)
-            let value = chunks->TransportMessage.reassembleChunks->JSON.parseOrThrow
-            let normalized = value->MessageChunker.normalizeJson
-            if normalized->MessageChunker.byteLength > runtime.transport.maxMessageBytes {
-              rejectInvalidResponse(runtime, id)
-            } else {
-              switch takePendingRequest(runtime, id) {
-              | Some(pending) => pending.resolve(normalized)
-              | None => ()
+      | Some(_) | None => {
+          pending.responseAssembly = Some({senderKey, messageId})
+          switch RequestHandler.addChunk(
+            runtime.requestHandler,
+            ~senderKey,
+            chunk,
+            ~final=chunk->TransportMessage.Chunk.isLast,
+          ) {
+          | Some(json) => {
+              let value = json->JSON.parseOrThrow
+              let normalized = value->MessageChunker.normalizeJson
+              if normalized->MessageChunker.byteLength > runtime.transport.maxMessageBytes {
+                rejectInvalidResponse(runtime, id)
+              } else {
+                switch takePendingRequest(runtime, id) {
+                | Some(pending) => pending.resolve(normalized)
+                | None => ()
+                }
               }
             }
+          | None => ()
           }
         }
       }
@@ -417,8 +373,6 @@ let make:
     let runtime = {
       transport: transportCore,
       pendingRequests: Map.make(),
-      responseStoredBytes: 0,
-      responseAssemblyCount: 0,
       activeRequests: Map.make(),
       settledRequests: Map.make(),
       requestHandler: RequestHandler.makeState(
@@ -462,7 +416,7 @@ let make:
               | _ => rejectInvalidResponse(runtime, id)
               }
             }
-          | SuccessChunk({id, chunk}) => resolveResponseChunk(runtime, id, chunk)
+          | SuccessChunk({id, chunk}) => resolveResponseChunk(runtime, id, chunk, sender)
           | Failure({id, message}) =>
             if (
               Type.typeof(Obj.magic(message)) === #string &&
