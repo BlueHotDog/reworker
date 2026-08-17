@@ -428,47 +428,15 @@ let testChunkAssembliesAreSenderScoped = () => {
     }
   for index in 0 to chunks->Array.length - 2 {
     let chunk = chunks[index]->Option.getOrThrow
-    RequestHandler.make(
-      state,
-      ~userHandler=handler,
-      Obj.magic(chunk),
-      1,
-      "sender-1",
-      Id.make(),
-      None,
-    )->ignore
-    RequestHandler.make(
-      state,
-      ~userHandler=handler,
-      Obj.magic(chunk),
-      2,
-      "sender-2",
-      Id.make(),
-      None,
-    )->ignore
+    RequestHandler.make(state, ~userHandler=handler, Obj.magic(chunk), 1, "sender-1", None)->ignore
+    RequestHandler.make(state, ~userHandler=handler, Obj.magic(chunk), 2, "sender-2", None)->ignore
   }
   let finalChunk = chunks[chunks->Array.length - 1]->Option.getOrThrow
   let first: Response.t<string> = Obj.magic(
-    RequestHandler.make(
-      state,
-      ~userHandler=handler,
-      Obj.magic(finalChunk),
-      1,
-      "sender-1",
-      Id.make(),
-      None,
-    ),
+    RequestHandler.make(state, ~userHandler=handler, Obj.magic(finalChunk), 1, "sender-1", None),
   )
   let second: Response.t<string> = Obj.magic(
-    RequestHandler.make(
-      state,
-      ~userHandler=handler,
-      Obj.magic(finalChunk),
-      2,
-      "sender-2",
-      Id.make(),
-      None,
-    ),
+    RequestHandler.make(state, ~userHandler=handler, Obj.magic(finalChunk), 2, "sender-2", None),
   )
   switch first {
   | Response.RespondNow(first) =>
@@ -497,7 +465,6 @@ let testMalformedChunkLimits = () => {
     TransportMessage.IntermediateChunk(first),
     (),
     "sender",
-    Id.make(),
     None,
   )->ignore
   let duplicateRejected = expectThrow(
@@ -508,7 +475,6 @@ let testMalformedChunkLimits = () => {
         TransportMessage.IntermediateChunk(first),
         (),
         "sender",
-        Id.make(),
         None,
       )->ignore,
     "Malformed chunk sequence",
@@ -521,7 +487,6 @@ let testMalformedChunkLimits = () => {
         TransportMessage.FinalChunk(final),
         (),
         "sender",
-        Id.make(),
         None,
       )->ignore,
     "Malformed chunk sequence",
@@ -540,7 +505,6 @@ let testMalformedChunkLimits = () => {
         TransportMessage.FinalChunk(oversized),
         (),
         "sender",
-        Id.make(),
         None,
       )->ignore,
     "maxChunkBytes",
@@ -557,7 +521,6 @@ let testMalformedChunkLimits = () => {
       ),
       (),
       "sender",
-      Id.make(),
       None,
     )->ignore
   addAssembly(firstAssemblyId)
@@ -586,7 +549,6 @@ let testMalformedChunkLimits = () => {
       ),
       (),
       "sender",
-      Id.make(),
       None,
     )->ignore
   addAggregate(aggregateFirstId, 0, 3)
@@ -609,7 +571,6 @@ let testMalformedChunkLimits = () => {
         TransportMessage.FinalChunk(malformedChunk),
         (),
         "sender",
-        Id.make(),
         None,
       )->ignore,
     "Malformed chunk sequence",

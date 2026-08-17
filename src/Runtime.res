@@ -47,11 +47,6 @@ type cancellation = {
   assemblyId: option<Id.t>,
 }
 
-type castMessage = {
-  id: Id.t,
-  message: Obj.t,
-}
-
 type responseChunk = {
   id: Id.t,
   chunk: TransportMessage.chunk,
@@ -60,7 +55,7 @@ type responseChunk = {
 type protocolMessage =
   | Request({id: Id.t, message: Obj.t})
   | Cancel(cancellation)
-  | Cast(castMessage)
+  | Cast(Obj.t)
   | Success({id: Id.t, value: Obj.t})
   | SuccessChunk(responseChunk)
   | Failure({id: Id.t, message: string})
@@ -626,10 +621,7 @@ let sendMessage:
 
 let castTransportMessage = (runtime, message) => {
   try {
-    sendProtocolMessage(
-      runtime,
-      (Cast({id: Id.make(), message: Obj.magic(message)}): protocolMessage),
-    )
+    sendProtocolMessage(runtime, (Cast(Obj.magic(message)): protocolMessage))
   } catch {
   | error => Console.error2("Failed to cast message:", error)
   }
@@ -842,7 +834,6 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
             Obj.magic(message),
             sender,
             senderKey,
-            id,
             None,
           ) {
           | Response.RespondNow(value) => sendResponse(runtime, sender, Success({id, value}))
@@ -865,7 +856,7 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
             RequestHandler.cancel(runtime.requestHandler, senderKey, messageId)
           )
         }
-      | Cast({id, message}) =>
+      | Cast(message) =>
         try {
           RequestHandler.make(
             runtime.requestHandler,
@@ -874,7 +865,6 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
             Obj.magic(message),
             sender,
             senderKey,
-            id,
             None,
           )->ignore
         } catch {

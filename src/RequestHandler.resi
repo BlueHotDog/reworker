@@ -23,6 +23,5 @@ let make: (
   TransportMessage.t<'a>,
   'sender,
   string,
-  Id.t,
   option<AbortSignal.t>,
 ) => Response.t<'a>
