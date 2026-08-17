@@ -9,8 +9,7 @@ dispatch, chunk assembly, and lifecycle ownership.
 
 - Register one protocol listener per runtime.
 - Decode or reassemble each inbound transport message once.
-- Dispatch completed user messages to application handlers in runtime order.
-- Keep first-response-wins semantics and abort losing deferred handlers.
+- Dispatch each completed user message to one application handler.
 - Keep chunk assembly in one request-path implementation.
 - Keep window connection lifecycle inside `WindowTransport`.
 
@@ -18,6 +17,7 @@ dispatch, chunk assembly, and lifecycle ownership.
 
 - Preserve public `.resi` signatures and documented error behavior.
 - Preserve request typing, casts, cancellation, limits, generations, and teardown.
+- Reject a different second handler instead of implementing handler arbitration.
 - Do not add dependencies or compatibility shims.
 - Do not weaken validation or resource accounting.
 

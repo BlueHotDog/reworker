@@ -44,6 +44,8 @@ let handler = (msg, _sender, signal) => {
 Runtime.OnMessage.addListener(runtime, handler)
 ```
 
+Each runtime owns one message handler. Registering a different second handler throws; compose domain-specific handlers in application code before registration.
+
 Transport values provide an ordered duplex connection. Reworker owns request correlation, timeouts, remote errors, casts, and chunking. Each value owns independent listener, request, and chunk state.
 
 ```rescript

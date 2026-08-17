@@ -230,7 +230,6 @@ type Types.message<_> +=
   | FailLater: Types.message<string>
   | NeverRespond: Types.message<string>
   | Cancellable: Types.message<string>
-  | MultiHandler: Types.message<string>
   | LargeResponse(int): Types.message<string>
   | UnitResponse: Types.message<unit>
   | UncloneableResponse: Types.message<string>
@@ -293,7 +292,6 @@ let rightHandler:
       )
     | NeverRespond => Response.none
     | Cancellable => Response.none
-    | MultiHandler => Response.none
     | LargeResponse(size) => Response.now("r"->String.repeat(size))
     | UnitResponse => Response.now()
     | UncloneableResponse => Response.now(Obj.magic(() => ()))
@@ -382,25 +380,8 @@ let testPostFailure = async () => {
 }
 
 let testChunkedRoundTrip = async () => {
-  let passiveHandler = (_message, _sender, _signal) => Response.none
-  Runtime.OnMessage.addListener(rightRuntime, passiveHandler)
   let value = "A"->String.repeat(MessageChunker.defaultChunkSize + 1000)
   let response = await Runtime.sendMessage(leftRuntime, Echo(value))
-  Runtime.OnMessage.removeListener(rightRuntime, passiveHandler)
-  response === value
-}
-
-let testChunkedRoundTripWithPassiveFirst = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let passiveHandler = (_message, _sender, _signal) => Response.none
-  Runtime.OnMessage.addListener(right, passiveHandler)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let value = "B"->String.repeat(MessageChunker.defaultChunkSize + 1000)
-  let response = await Runtime.sendMessage(left, Echo(value))
-  Runtime.close(left)
-  Runtime.close(right)
   response === value
 }
 
@@ -580,17 +561,33 @@ let testMalformedChunkLimits = () => {
 }
 
 let testListenerRemoval = () => {
+  let pair = makeTransportPair()
+  let runtime = Runtime.make(pair.left)
   let handler = (message, _sender, _signal) => {
     switch message {
     | Echo(value) => Response.now(value)
     | _ => Response.none
     }
   }
-  let before = leftMessageListeners.contents->Array.length
-  Runtime.OnMessage.addListener(leftRuntime, handler)
-  Runtime.OnMessage.addListener(leftRuntime, handler)
-  Runtime.OnMessage.removeListener(leftRuntime, handler)
-  leftMessageListeners.contents->Array.length === before
+  Runtime.OnMessage.addListener(runtime, handler)
+  Runtime.OnMessage.addListener(runtime, handler)
+  Runtime.OnMessage.removeListener(runtime, handler)
+  Runtime.close(runtime)
+  true
+}
+
+let testSecondHandlerRejected = () => {
+  let pair = makeTransportPair()
+  let runtime = Runtime.make(pair.left)
+  let first = (_message, _sender, _signal) => Response.none
+  let second = (_message, _sender, _signal) => Response.none
+  Runtime.OnMessage.addListener(runtime, first)
+  let rejected = expectThrow(
+    () => Runtime.OnMessage.addListener(runtime, second),
+    "Runtime already has a message handler",
+  )
+  Runtime.close(runtime)
+  rejected
 }
 
 let testContextValidity = () => Runtime.isContextValid(leftRuntime)
@@ -638,14 +635,6 @@ let testConcurrentRuntimeIsolation = async () => {
   let secondRight = Runtime.make(secondPair.right)
   Runtime.OnMessage.addListener(firstRight, rightHandler)
   Runtime.OnMessage.addListener(secondRight, rightHandler)
-  let removedHandler = (message, _sender, _signal) => {
-    switch message {
-    | Echo(_) => Response.now("removed handler responded")
-    | _ => Response.none
-    }
-  }
-  Runtime.OnMessage.addListener(secondRight, removedHandler)
-  Runtime.OnMessage.removeListener(secondRight, removedHandler)
 
   let firstResponse = Runtime.sendMessage(firstLeft, Echo("first"))
   let secondResponse = Runtime.sendMessage(secondLeft, Echo("second"))
@@ -932,40 +921,6 @@ let testDisconnectCancelsRemote = async () => {
   rejected && started.contents === 1 && aborted.contents === 1
 }
 
-let testWinningHandlerCancelsLosers = async () => {
-  let pair = makeTransportPair()
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let losingAbortCount = ref(0)
-  let losingHandler:
-    type response. (Types.message<response>, unit, option<AbortSignal.t>) => Response.t<response> =
-    (message, _sender, signal) => {
-      switch message {
-      | MultiHandler => {
-          switch signal {
-          | Some(signal) =>
-            AbortSignal.addEventListener(signal, "abort", () => losingAbortCount := 1)
-          | None => ()
-          }
-          Response.later(Promise.make((_resolve, _reject) => ()))
-        }
-      | _ => Response.none
-      }
-    }
-  let winningHandler = (message, _sender, _signal) => {
-    switch message {
-    | MultiHandler => Response.now("winner")
-    | _ => Response.none
-    }
-  }
-  Runtime.OnMessage.addListener(right, losingHandler)
-  Runtime.OnMessage.addListener(right, winningHandler)
-  let response = await Runtime.sendMessage(left, MultiHandler)
-  Runtime.close(left)
-  Runtime.close(right)
-  response === "winner" && losingAbortCount.contents === 1
-}
-
 let testChunkCancellationBetweenParts = async () => {
   let pair = makeTransportPair()
   let left = Runtime.make(pair.left)
@@ -1230,29 +1185,6 @@ let testCastMessageSizeLimit = () => {
   rejected && pair.leftEndpoint.postCount.contents === 0
 }
 
-let testChunkedCastWithPassiveFirst = () => {
-  let pair = makeTransportPair(~maxMessageBytes=10_000, ~maxChunkBytes=100)
-  let left = Runtime.make(pair.left)
-  let right = Runtime.make(pair.right)
-  let received = ref(0)
-  let passiveHandler = (_message, _sender, _signal) => Response.none
-  let noticeHandler = (message, _sender, _signal) => {
-    switch message {
-    | Notice(_) => {
-        received := received.contents + 1
-        Response.none
-      }
-    | _ => Response.none
-    }
-  }
-  Runtime.OnMessage.addListener(right, passiveHandler)
-  Runtime.OnMessage.addListener(right, noticeHandler)
-  Runtime.cast(left, Notice("n"->String.repeat(1000)))
-  Runtime.close(left)
-  Runtime.close(right)
-  received.contents === 1
-}
-
 let testInvalidRuntimeLimits = () => {
   let tinyChunks = makeTransportPair(~maxMessageBytes=100, ~maxChunkBytes=3)
   let oversizedLimit = makeTransportPair(~maxMessageBytes=1_000_000_001, ~maxChunkBytes=100)
@@ -1275,6 +1207,7 @@ let runTests = async () => {
   let syncTests = [
     ("typed fire-and-forget cast", testCast),
     ("listener removal", testListenerRemoval),
+    ("second handler rejected", testSecondHandlerRejected),
     ("context validity", testContextValidity),
     ("value runtime construction", testValueRuntimeConstruction),
     ("removable lifecycle subscriptions", testLifecycleSubscriptions),
@@ -1283,7 +1216,6 @@ let runTests = async () => {
     ("chunk assemblies are sender scoped", testChunkAssembliesAreSenderScoped),
     ("malformed chunk limits", testMalformedChunkLimits),
     ("cast message size limit", testCastMessageSizeLimit),
-    ("chunked cast with passive handler first", testChunkedCastWithPassiveFirst),
     ("stale request ignored", testStaleRequestIgnored),
     ("malformed protocol ignored", testMalformedProtocolIgnored),
     ("invalid runtime limits", testInvalidRuntimeLimits),
@@ -1297,7 +1229,6 @@ let runTests = async () => {
     ("request timeout", testTimeout),
     ("structured clone failure", testPostFailure),
     ("chunked request round trip", testChunkedRoundTrip),
-    ("chunked request with passive handler first", testChunkedRoundTripWithPassiveFirst),
     ("concurrent runtime isolation", testConcurrentRuntimeIsolation),
     ("deferred response after close", testDeferredResponseAfterClose),
     ("pre-aborted request", testPreAbortedRequest),
@@ -1307,7 +1238,6 @@ let runTests = async () => {
     ("response wins abort race", testResponseWinsAbortRace),
     ("timeout cancels remote handler", testTimeoutCancelsRemote),
     ("disconnect cancels remote handler", testDisconnectCancelsRemote),
-    ("winning handler cancels losing handlers", testWinningHandlerCancelsLosers),
     ("chunk cancellation between parts", testChunkCancellationBetweenParts),
     ("message size limit", testMessageSizeLimit),
     ("response size limit", testResponseSizeLimit),

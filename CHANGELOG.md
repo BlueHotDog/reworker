@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Require explicit parent `connect` and child `listen` startup for window transports
 - Pass an optional `AbortSignal.t` to message handlers and propagate request cancellation to remote handlers
 - Require transport lifecycle, sender identity, generation validation, and resource-limit operations
+- Limit each runtime to one application message handler
 - Validate JSON-compatible payloads, chunk oversized requests, and bound response sizes
 - Upgrade the development compiler from ReScript 12 beta to ReScript 12.3
 - Support all stable ReScript 12 releases
