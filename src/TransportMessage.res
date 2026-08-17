@@ -38,21 +38,15 @@ module Chunk = {
 
 // Create chunks from a large message string
 // Returns array of transport messages with proper response types
-let createRawChunks = (message: 'a, ~size) => {
+let createChunks = (message: 'a, ~size=MessageChunker.defaultChunkSize) => {
   let messageString = message->JSON.stringifyAny->Option.getOrThrow
   let messageId = Id.make()
   let rawChunks =
     messageString->MessageChunker.splitIntoChunks(~size, ())->Array.map(MessageChunker.decodeBinary)
 
-  rawChunks->Array.mapWithIndex((body, index) =>
-    Chunk.make(~messageId, ~index, ~total=rawChunks->Array.length, ~body)
-  )
-}
-
-let createChunks = (message: 'a, ~size=MessageChunker.defaultChunkSize) => {
-  let chunks = message->createRawChunks(~size)
-  chunks->Array.mapWithIndex((chunk, index) => {
-    if index === chunks->Array.length - 1 {
+  rawChunks->Array.mapWithIndex((body, index) => {
+    let chunk = Chunk.make(~messageId, ~index, ~total=rawChunks->Array.length, ~body)
+    if index === rawChunks->Array.length - 1 {
       FinalChunk(chunk)
     } else {
       IntermediateChunk(chunk)

@@ -47,32 +47,20 @@ type cancellation = {
   assemblyId: option<Id.t>,
 }
 
-type responseChunk = {
-  id: Id.t,
-  chunk: TransportMessage.chunk,
-}
-
 type protocolMessage =
   | Request({id: Id.t, message: Obj.t})
   | Cancel(cancellation)
   | Cast(Obj.t)
   | Success({id: Id.t, value: Obj.t})
-  | SuccessChunk(responseChunk)
   | Failure({id: Id.t, message: string})
 
 @scope("Object") @val external hasOwn: (Obj.t, string) => bool = "hasOwn"
-
-type responseAssembly = {
-  senderKey: string,
-  messageId: Id.t,
-}
 
 type pendingRequest = {
   resolve: Obj.t => unit,
   reject: JsError.t => unit,
   timeoutId: timeoutId,
   removeAbortListener: unit => unit,
-  mutable responseAssembly: option<responseAssembly>,
 }
 
 type registeredMessageHandler<'sender> = (
@@ -162,11 +150,6 @@ let takePendingRequest = (runtime, id) => {
   | Some(pending) => {
       clearTimeout(pending.timeoutId)
       pending.removeAbortListener()
-      switch pending.responseAssembly {
-      | Some(assembly) =>
-        RequestHandler.cancel(runtime.requestHandler, assembly.senderKey, assembly.messageId)
-      | None => ()
-      }
       runtime.pendingRequests->Map.delete(id)->ignore
       Some(pending)
     }
@@ -288,46 +271,6 @@ let rejectInvalidResponse = (runtime, id) => {
   rejectPendingRequest(runtime, id, "Invalid response payload")
 }
 
-let resolveResponseChunk = (runtime, id, chunk, sender) => {
-  switch runtime.pendingRequests->Map.get(id) {
-  | None => ()
-  | Some(pending) =>
-    try {
-      let messageId = chunk->TransportMessage.Chunk.messageId
-      let senderKey = `response:${runtime.transport.senderKey(sender)}:${id->Id.toString}`
-      switch pending.responseAssembly {
-      | Some(assembly) if assembly.senderKey !== senderKey || assembly.messageId !== messageId =>
-        rejectInvalidResponse(runtime, id)
-      | Some(_) | None => {
-          pending.responseAssembly = Some({senderKey, messageId})
-          switch RequestHandler.addChunk(
-            runtime.requestHandler,
-            ~senderKey,
-            chunk,
-            ~final=chunk->TransportMessage.Chunk.isLast,
-          ) {
-          | Some(json) => {
-              let value = json->JSON.parseOrThrow
-              let normalized = value->MessageChunker.normalizeJson
-              if normalized->MessageChunker.byteLength > runtime.transport.maxMessageBytes {
-                rejectInvalidResponse(runtime, id)
-              } else {
-                switch takePendingRequest(runtime, id) {
-                | Some(pending) => pending.resolve(normalized)
-                | None => ()
-                }
-              }
-            }
-          | None => ()
-          }
-        }
-      }
-    } catch {
-    | _ => rejectInvalidResponse(runtime, id)
-    }
-  }
-}
-
 let make:
   type sender extension. transport<sender, extension> => t<sender> =
   transport => {
@@ -416,7 +359,6 @@ let make:
               | _ => rejectInvalidResponse(runtime, id)
               }
             }
-          | SuccessChunk({id, chunk}) => resolveResponseChunk(runtime, id, chunk, sender)
           | Failure({id, message}) =>
             if (
               Type.typeof(Obj.magic(message)) === #string &&
@@ -495,7 +437,6 @@ let sendRequest = (
             reject,
             timeoutId,
             removeAbortListener,
-            responseAssembly: None,
           },
         )
 
@@ -596,14 +537,14 @@ let sendResponse = (runtime, sender, message) => {
         | Failure({id, message})
           if message->MessageChunker.stringByteLength > runtime.transport.maxMessageBytes =>
           (Failure({id, message: "Remote error exceeds maxMessageBytes"}): protocolMessage)
-        | SuccessChunk(_) | Failure(_) | Request(_) | Cancel(_) | Cast(_) => message
+        | Failure(_) | Request(_) | Cancel(_) | Cast(_) => message
         }
       } catch {
       | _ =>
         switch message {
         | Success({id, value: _}) | Failure({id, message: _}) =>
           (Failure({id, message: "Response could not be serialized"}): protocolMessage)
-        | SuccessChunk(_) | Request(_) | Cancel(_) | Cast(_) => message
+        | Request(_) | Cancel(_) | Cast(_) => message
         }
       }
       let sendCloneFailure = id => {
@@ -616,27 +557,13 @@ let sendResponse = (runtime, sender, message) => {
         | _ => ()
         }
       }
-      switch boundedMessage {
-      | Success({id, value})
-        if value->MessageChunker.byteLength > runtime.transport.maxChunkBytes =>
-        try {
-          value
-          ->TransportMessage.createRawChunks(~size=runtime.transport.maxChunkBytes)
-          ->Array.forEach(chunk => {
-            sendProtocolMessage(runtime, (SuccessChunk({id, chunk}): protocolMessage))
-          })
-        } catch {
-        | _ => sendCloneFailure(id)
-        }
-      | Success(_) | SuccessChunk(_) | Failure(_) | Request(_) | Cancel(_) | Cast(_) =>
-        try {
-          sendProtocolMessage(runtime, boundedMessage)
-        } catch {
-        | _ =>
-          switch boundedMessage {
-          | Success({id, value: _}) => sendCloneFailure(id)
-          | SuccessChunk(_) | Failure(_) | Request(_) | Cancel(_) | Cast(_) => ()
-          }
+      try {
+        sendProtocolMessage(runtime, boundedMessage)
+      } catch {
+      | _ =>
+        switch boundedMessage {
+        | Success({id, value: _}) => sendCloneFailure(id)
+        | Failure(_) | Request(_) | Cancel(_) | Cast(_) => ()
         }
       }
     } catch {
@@ -824,7 +751,7 @@ let handleInboundProtocol = (runtime, rawMessage, sender) => {
         } catch {
         | _ => ()
         }
-      | Success(_) | SuccessChunk(_) | Failure(_) => ()
+      | Success(_) | Failure(_) => ()
       }
     } catch {
     | _ => ()

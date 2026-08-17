@@ -11,7 +11,7 @@ dispatch, chunk assembly, and lifecycle ownership.
 - Decode or reassemble each inbound transport message once.
 - Dispatch completed user messages to application handlers in runtime order.
 - Keep first-response-wins semantics and abort losing deferred handlers.
-- Use one bounded chunk assembly implementation for requests and responses.
+- Keep chunk assembly in one request-path implementation.
 - Keep window connection lifecycle inside `WindowTransport`.
 
 ## Boundaries
@@ -25,7 +25,7 @@ dispatch, chunk assembly, and lifecycle ownership.
 
 1. Replace per-handler transport listeners with one runtime dispatcher.
 2. Remove duplicate-delivery and completed-assembly bookkeeping.
-3. Unify request and response chunk assembly.
+3. Remove response chunking added during hardening; retain bounded responses.
 4. Simplify tests and documentation only where behavior remains explicit.
 
 ## Verification
@@ -40,6 +40,6 @@ dispatch, chunk assembly, and lifecycle ownership.
 
 - One transport message listener handles runtime protocol traffic.
 - No request/cast delivery maps or completed chunk replay cache remain.
-- Request and response paths share bounded assembly logic.
+- Response size remains bounded without a second assembly protocol.
 - Runtime and request-handler code shrink materially.
 - Existing tests pass without relaxing assertions.

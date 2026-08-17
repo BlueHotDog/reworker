@@ -39,7 +39,6 @@ type testEndpoint = {
   isCurrentSender: ref<bool>,
   postCount: ref<int>,
   lastPosted: ref<option<Obj.t>>,
-  posted: ref<array<Obj.t>>,
   afterPost: ref<unit => unit>,
 }
 
@@ -67,7 +66,6 @@ let makeTransportPair = (
     isCurrentSender: ref(true),
     postCount: ref(0),
     lastPosted: ref(None),
-    posted: ref([]),
     afterPost: ref(() => ()),
   }
   let rightEndpoint = {
@@ -78,7 +76,6 @@ let makeTransportPair = (
     isCurrentSender: ref(true),
     postCount: ref(0),
     lastPosted: ref(None),
-    posted: ref([]),
     afterPost: ref(() => ()),
   }
 
@@ -109,7 +106,6 @@ let makeTransportPair = (
       if endpoint.isOpen.contents {
         endpoint.postCount := endpoint.postCount.contents + 1
         endpoint.lastPosted := Some(message)
-        endpoint.posted := endpoint.posted.contents->Array.concat([message])
         peer.messageListeners.contents->Array.forEach(listener => listener(message, ()))
         endpoint.afterPost.contents()
         Ok()
@@ -958,7 +954,7 @@ let testResponseSizeLimit = async () => {
   rejected
 }
 
-let testChunkedResponseRoundTrip = async () => {
+let testLargeResponseRoundTrip = async () => {
   let pair = makeTransportPair(~maxMessageBytes=1000, ~maxChunkBytes=50)
   let left = Runtime.make(pair.left)
   let right = Runtime.make(pair.right)
@@ -966,7 +962,7 @@ let testChunkedResponseRoundTrip = async () => {
   let response = await Runtime.sendMessage(left, LargeResponse(200))
   Runtime.close(left)
   Runtime.close(right)
-  response === "r"->String.repeat(200) && pair.rightEndpoint.postCount.contents > 1
+  response === "r"->String.repeat(200)
 }
 
 let testStaleRequestIgnored = () => {
@@ -1017,31 +1013,6 @@ let testStaleResponseIgnored = async () => {
   rejected
 }
 
-let testMalformedResponseChunkRejected = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=1000, ~maxChunkBytes=50)
-  let left = Runtime.make(pair.left)
-  let pending = Runtime.sendMessage(left, Echo("request"))
-  let request: Dict.t<Obj.t> = pair.leftEndpoint.lastPosted.contents->Option.getOrThrow->Obj.magic
-  let requestId = request->Dict.get("id")->Option.getOrThrow
-  let chunk: Dict.t<Obj.t> = Dict.make()
-  chunk->Dict.set("messageId", Obj.magic(Id.make()))
-  chunk->Dict.set("index", Obj.magic(0))
-  chunk->Dict.set("total", Obj.magic(2))
-  chunk->Dict.set("body", Obj.magic("x"))
-  let payload: Dict.t<Obj.t> = Dict.make()
-  payload->Dict.set("id", requestId)
-  payload->Dict.set("chunk", Obj.magic(chunk))
-  let response: Dict.t<Obj.t> = Dict.make()
-  response->Dict.set("TAG", Obj.magic("SuccessChunk"))
-  response->Dict.set("_0", Obj.magic(payload))
-  pair.leftEndpoint.messageListeners.contents->Array.forEach(listener =>
-    listener(Obj.magic(response), ())
-  )
-  let rejected = await expectRejection(pending, "Invalid response payload")
-  Runtime.close(left)
-  rejected
-}
-
 let testMissingSuccessValueRejected = async () => {
   let pair = makeTransportPair()
   let left = Runtime.make(pair.left)
@@ -1056,32 +1027,6 @@ let testMissingSuccessValueRejected = async () => {
   let rejected = await expectRejection(pending, "Invalid response payload")
   Runtime.close(left)
   rejected
-}
-
-let testResponseChunkAggregateLimit = async () => {
-  let pair = makeTransportPair(~maxMessageBytes=300, ~maxPendingRequests=2, ~maxChunkBytes=100)
-  let left = Runtime.make(pair.left)
-  let responseListeners = pair.leftEndpoint.messageListeners.contents
-  pair.leftEndpoint.messageListeners := []
-  let right = Runtime.make(pair.right)
-  Runtime.OnMessage.addListener(right, rightHandler)
-  let first = Runtime.sendMessage(left, LargeResponse(200))
-  let second = Runtime.sendMessage(left, LargeResponse(200))
-  let chunks = pair.rightEndpoint.posted.contents
-  let deliver = index => {
-    let chunk = chunks[index]->Option.getOrThrow
-    responseListeners->Array.forEach(listener => listener(chunk, ()))
-  }
-  let chunksPerResponse = chunks->Array.length / 2
-  for index in 0 to chunksPerResponse - 2 {
-    deliver(index)
-    deliver(chunksPerResponse + index)
-  }
-  let secondRejected = await expectRejection(second, "Invalid response payload")
-  Runtime.close(left)
-  let firstRejected = await expectRejection(first, "Runtime closed")
-  Runtime.close(right)
-  firstRejected && secondRejected
 }
 
 let testUnitResponseWithinLimits = async () => {
@@ -1302,11 +1247,9 @@ let runTests = async () => {
     ("chunk cancellation between parts", testChunkCancellationBetweenParts),
     ("message size limit", testMessageSizeLimit),
     ("response size limit", testResponseSizeLimit),
-    ("chunked response round trip", testChunkedResponseRoundTrip),
+    ("large response round trip", testLargeResponseRoundTrip),
     ("stale response ignored", testStaleResponseIgnored),
-    ("malformed response chunk rejected", testMalformedResponseChunkRejected),
     ("missing success value rejected", testMissingSuccessValueRejected),
-    ("response chunk aggregate limit", testResponseChunkAggregateLimit),
     ("unit response within limits", testUnitResponseWithinLimits),
     ("uncloneable response failure", testUncloneableResponseFailure),
     ("binary payload rejection", testBinaryPayloadRejection),

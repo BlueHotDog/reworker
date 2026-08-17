@@ -27,7 +27,6 @@ type rec t<'response> =
 
 // Functions needed by Runtime.res and RequestHandler.res
 let createChunks: ('a, ~size: int=?) => array<t<chunkAck>>
-let createRawChunks: ('a, ~size: int) => array<chunk>
 let reassembleChunks: array<chunk> => string
 let messageId: t<chunkAck> => option<Id.t>
 let isIntermediate: t<chunkAck> => bool
