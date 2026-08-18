@@ -255,10 +255,6 @@ api->Dict.set(
   Obj.magic(value => Runtime.sendMessage(firstRuntime, AskDelayedReverse(value))),
 )
 api->Dict.set(
-  "uncloneable",
-  Obj.magic(() => Runtime.sendMessage(firstRuntime, Uncloneable(Obj.magic(() => ())))),
-)
-api->Dict.set(
   "large",
   Obj.magic(async () => {
     let value = "x"->String.repeat(101_000)

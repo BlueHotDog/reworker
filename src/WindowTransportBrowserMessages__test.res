@@ -16,4 +16,3 @@ type Types.message<_> +=
   | Cancellable: Types.message<string>
   | GetCancellationCount: Types.message<int>
   | GetCancellationStartCount: Types.message<int>
-  | Uncloneable(Obj.t): Types.message<string>

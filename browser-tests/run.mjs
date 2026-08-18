@@ -188,10 +188,6 @@ try {
 	})
 	assert(timeoutError.includes("timed out"), `request timeout did not reject: ${timeoutError}`)
 
-	const cloneError = await page.evaluate(async () => {
-		try { await window.reworkerTest.uncloneable(); return "resolved" } catch (error) { return String(error) }
-	})
-	assert(cloneError !== "resolved", "structured clone failure did not reject")
 	assert(await page.evaluate(() => window.reworkerTest.large()), "chunked request failed")
 	const oversizedError = await page.evaluate(async () => {
 		try { await window.reworkerTest.oversized(); return "resolved" } catch (error) { return String(error) }

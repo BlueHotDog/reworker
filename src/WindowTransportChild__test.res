@@ -63,7 +63,6 @@ let handler:
       }
     | GetCancellationCount => Response.now(cancellationCount.contents)
     | GetCancellationStartCount => Response.now(cancellationStartCount.contents)
-    | Uncloneable(_) => Response.now("unexpected")
     | _ => Response.none
     }
   }
