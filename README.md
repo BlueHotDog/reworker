@@ -180,8 +180,11 @@ remote errors are bounded by `maxMessageBytes`; oversized or unserializable
 responses become bounded failures. Transport must therefore carry direct
 response protocol messages up to configured runtime bound.
 
-Payloads must be JSON-compatible because runtime serializes them for safe size
-measurement and chunking.
+Payloads use standard JSON serialization semantics. Each outbound payload is
+serialized once during preparation. Runtime uses the parsed result for direct
+delivery and chunks the same encoded bytes when needed. Normal JSON conversions
+therefore apply, such as non-finite numbers becoming `null` and undefined object
+fields being omitted.
 
 ## Cross-Origin Iframes
 

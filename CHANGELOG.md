@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Send responses directly without response chunking, while bounding response payloads with `maxMessageBytes`
 - Give each physical connection a runtime-owned session capability; beginning a replacement makes older session sinks stale and rejects their pending work
 - Keep window handshake IDs private to `WindowTransport`; custom transports no longer generate, expose, or retain runtime session identifiers
-- Validate JSON-compatible request, cast, and response payloads before dispatch
+- Canonicalize request, cast, and response payloads through JSON before dispatch
 - Restrict `Runtime.cast` to messages whose response type is `unit`; use `sendMessage` for response-bearing messages
 - Replace removed `isContextValid` checks with `Runtime.status(runtime) === Runtime.Open`
 - Upgrade the development compiler from ReScript 12 beta to ReScript 12.3

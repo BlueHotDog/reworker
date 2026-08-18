@@ -6,7 +6,6 @@
 type preparedJson = {
   value: Obj.t,
   encoded: option<Uint8Array.t>,
-  byteLength: int,
 }
 
 let maxChunksPerMessage: int

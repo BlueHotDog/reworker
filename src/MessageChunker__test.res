@@ -17,9 +17,62 @@ let testPreparedJson = () => {
   let withinLimit = MessageChunker.prepareJsonWithin({"message": "hello"}, ~maxBytes=19)
   let overLimit = MessageChunker.prepareJsonWithin({"message": "hello"}, ~maxBytes=18)
   prepared.encoded->Option.isSome &&
-  prepared.byteLength === 19 &&
+  prepared.encoded->Option.getOrThrow->TypedArray.byteLength === 19 &&
   withinLimit->Option.isSome &&
   overLimit->Option.isNone
+}
+
+let testCanonicalJson = () => {
+  try {
+    let prepared =
+      MessageChunker.prepareJsonWithin(
+        {"value": Float.Constants.nan},
+        ~maxBytes=100,
+      )->Option.getOrThrow
+    prepared.value->JSON.stringifyAny === Some(`{"value":null}`)
+  } catch {
+  | _ => false
+  }
+}
+
+let testActualChunkLimit = () => {
+  try {
+    let original = createLargeString(10_000)
+    let chunks =
+      original
+      ->MessageChunker.prepareJsonWithin(~maxBytes=20_000)
+      ->Option.getOrThrow
+      ->MessageChunker.chunkPrepared(~size=4)
+      ->Option.getOrThrow
+    chunks->Array.length < MessageChunker.maxChunksPerMessage &&
+      chunks->Array.join("")->JSON.parseOrThrow === original->Obj.magic
+  } catch {
+  | _ => false
+  }
+}
+
+let testRejectsUnsafeChunkSize = () => {
+  try {
+    "four"
+    ->MessageChunker.prepareJsonWithin(~maxBytes=100)
+    ->Option.getOrThrow
+    ->MessageChunker.chunkPrepared(~size=3)
+    ->ignore
+    false
+  } catch {
+  | _ => true
+  }
+}
+
+let testPreservesBomAtChunkBoundary = () => {
+  let original = "aaa\u{FEFF}a"
+  let chunks =
+    original
+    ->MessageChunker.prepareJsonWithin(~maxBytes=100)
+    ->Option.getOrThrow
+    ->MessageChunker.chunkPrepared(~size=4)
+    ->Option.getOrThrow
+  chunks->Array.join("")->JSON.parseOrThrow === original->Obj.magic
 }
 
 // Test: Chunk splitting and reassembly
@@ -96,6 +149,10 @@ let testUnicodeHandling = () => {
 let runTests = () => {
   let tests = [
     ("JSON preparation", testPreparedJson),
+    ("JSON canonicalization", testCanonicalJson),
+    ("Actual chunk limit", testActualChunkLimit),
+    ("Unsafe chunk size", testRejectsUnsafeChunkSize),
+    ("BOM at chunk boundary", testPreservesBomAtChunkBoundary),
     ("Chunk split and reassemble", testChunkSplitAndReassemble),
     ("Unicode handling", testUnicodeHandling),
   ]

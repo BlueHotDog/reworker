@@ -9,7 +9,7 @@ chunked message passing in workers and Manifest V3 browser extensions.
   constructor determines its response type.
 - `src/Runtime.res` owns protocol framing, lifecycle state, request handling,
   cancellation, and transparent chunk reassembly.
-- `src/MessageChunker.res` validates and prepares JSON payloads once, then
+- `src/MessageChunker.res` canonicalizes and prepares JSON payloads once, then
   splits their encoded bytes at safe UTF-8 boundaries when needed.
 - `src/Response.res` represents immediate, deferred, and absent responses.
 - `src/Channel.res` and `src/ChannelTypes.res` provide persistent port channels
