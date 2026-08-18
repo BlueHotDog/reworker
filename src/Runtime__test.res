@@ -12,6 +12,7 @@ type Types.message<_> +=
   | Fail: Types.message<string>
   | Ignored: Types.message<string>
   | ThrowUnstringifiable: Types.message<string>
+  | ReplaceOnSerialize: Types.message<Obj.t>
 
 @scope("Object") @val external defineProperty: (Obj.t, string, Obj.t) => Obj.t = "defineProperty"
 
@@ -477,6 +478,151 @@ let testReplacementCapabilityStaysStaleAfterConnectingClose = () => {
   pair.leftEndpoint.teardownCount.contents === 1
 }
 
+let testResponseSerializationCannotCrossSessions = () => {
+  let pair = makePair()
+  let replacingHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) =>
+      switch message {
+      | ReplaceOnSerialize => {
+          let response: Dict.t<Obj.t> = Dict.make()
+          response->Dict.set(
+            "toJSON",
+            Obj.magic(() => {
+              let replacement = beginEndpointSession(pair.rightEndpoint)
+              replacement.opened()
+              "old-session-response"
+            }),
+          )
+          Response.now(Obj.magic(response))
+        }
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=replacingHandler)
+  Runtime.sendMessage(left, ReplaceOnSerialize)
+  ->Promise.catch(_ => Promise.resolve(Obj.magic()))
+  ->ignore
+  let blocked = pair.rightEndpoint.posts.contents->Array.length === 0
+  Runtime.close(left)
+  Runtime.close(right)
+  blocked
+}
+
+let testRequestSerializationCannotReplay = () => {
+  let pair = makePair()
+  let calls = ref(0)
+  let countingHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) => {
+      calls := calls.contents + 1
+      switch message {
+      | Echo(value) => Response.now(value)
+      | _ => Response.none
+      }
+    }
+  let runtime = Runtime.make(pair.right, ~limits=limits(), ~handler=countingHandler)
+  let id = "serialization-replay"
+  let message: Dict.t<Obj.t> = Dict.make()
+  message->Dict.set(
+    "toJSON",
+    Obj.magic(() => {
+      currentSession(pair.rightEndpoint).message(
+        protocol("Request", [("id", Obj.magic(id)), ("message", Obj.magic(Echo("replay")))]),
+        (),
+      )
+      Echo("original")
+    }),
+  )
+  currentSession(pair.rightEndpoint).message(
+    protocol("Request", [("id", Obj.magic(id)), ("message", Obj.magic(message))]),
+    (),
+  )
+  Runtime.close(runtime)
+  calls.contents === 1
+}
+
+let testCastSerializationCannotCrossSessions = () => {
+  let pair = makePair()
+  let calls = ref(0)
+  let countingHandler = (_message, _sender, _context) => {
+    calls := calls.contents + 1
+    Response.none
+  }
+  let runtime = Runtime.make(pair.right, ~limits=limits(), ~handler=countingHandler)
+  let staleSession = currentSession(pair.rightEndpoint)
+  let message: Dict.t<Obj.t> = Dict.make()
+  message->Dict.set(
+    "toJSON",
+    Obj.magic(() => {
+      let replacement = beginEndpointSession(pair.rightEndpoint)
+      replacement.opened()
+      Notice("stale")
+    }),
+  )
+  staleSession.message(protocol("Cast", [("_0", Obj.magic(message))]), ())
+  Runtime.close(runtime)
+  calls.contents === 0
+}
+
+let testOutboundCastSerializationCannotCrossSessions = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let message: Dict.t<Obj.t> = Dict.make()
+  message->Dict.set(
+    "toJSON",
+    Obj.magic(() => {
+      let replacement = beginEndpointSession(pair.leftEndpoint)
+      replacement.opened()
+      Notice("stale")
+    }),
+  )
+  let blocked = throwsWith(() => Runtime.cast(runtime, Obj.magic(message)), "not connected")
+  let sentNothing = pair.leftEndpoint.posts.contents->Array.length === 0
+  Runtime.close(runtime)
+  blocked && sentNothing
+}
+
+let testCastChunksCannotCrossSessions = () => {
+  let pair = makePair(~maxChunkBytes=20)
+  let deliver = pair.leftEndpoint.deliver
+  pair.leftEndpoint.deliver = payload => {
+    deliver(payload)
+    if pair.leftEndpoint.posts.contents->Array.length === 1 {
+      let replacement = beginEndpointSession(pair.leftEndpoint)
+      replacement.opened()
+    }
+  }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler)
+  let stopped = throwsWith(
+    () => Runtime.cast(left, Notice("x"->String.repeat(200))),
+    "not connected",
+  )
+  let sentOnlyFirst = pair.leftEndpoint.posts.contents->Array.length === 1
+  Runtime.close(left)
+  Runtime.close(right)
+  stopped && sentOnlyFirst
+}
+
+let testOutboundRequestSerializationCannotCrossSessions = async () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let message: Dict.t<Obj.t> = Dict.make()
+  message->Dict.set(
+    "toJSON",
+    Obj.magic(() => {
+      let replacement = beginEndpointSession(pair.leftEndpoint)
+      replacement.opened()
+      Echo("stale")
+    }),
+  )
+  let blocked = await rejectsWith(Runtime.sendMessage(runtime, Obj.magic(message)), "not connected")
+  let sentNothing = pair.leftEndpoint.posts.contents->Array.length === 0
+  Runtime.close(runtime)
+  blocked && sentNothing
+}
+
 let testDirectAndChunkedRoundTrip = async () => {
   let (pair, left, right) = makeRuntimes(~maxChunkBytes=32)
   let direct = await Runtime.sendMessage(left, Echo("small"))
@@ -819,6 +965,38 @@ let testActiveDirectReplayKeepsOriginalRequest = async () => {
   value === "original" && calls.contents === 1
 }
 
+let testActiveChunkReplayKeepsOriginalRequest = async () => {
+  let pair = makePair(~maxChunkBytes=20)
+  pair.leftEndpoint.autoDeliver := false
+  let calls = ref(0)
+  let resolveResponse: ref<option<string => unit>> = ref(None)
+  let delayedHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) =>
+      switch message {
+      | Echo(_) => {
+          calls := calls.contents + 1
+          Response.later(Promise.make((resolve, _reject) => resolveResponse := Some(resolve)))
+        }
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=delayedHandler)
+  let pending = Runtime.sendMessage(left, Echo("x"->String.repeat(200)))
+  let packets = pair.leftEndpoint.posts.contents->Array.copy
+  packets->Array.forEach(pair.leftEndpoint.deliver)
+  pair.leftEndpoint.deliver(packets[0]->Option.getOrThrow)
+  resolveResponse.contents->Option.forEach(resolve => resolve("original"))
+  let preserved = try {
+    (await pending) === "original"
+  } catch {
+  | _ => false
+  }
+  Runtime.close(left)
+  Runtime.close(right)
+  preserved && calls.contents === 1
+}
+
 let testReplayWindowEvictsOldestRequest = async () => {
   let pair = makePair(~maxChunkBytes=64)
   pair.leftEndpoint.autoDeliver := false
@@ -882,6 +1060,64 @@ let testMalformedRequestCannotLaterExecute = async () => {
   rejected && calls.contents === 0
 }
 
+let testInvalidDirectRequestCannotLaterExecute = () => {
+  let pair = makePair()
+  let calls = ref(0)
+  let countingHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) => {
+      calls := calls.contents + 1
+      switch message {
+      | Echo(value) => Response.now(value)
+      | _ => Response.none
+      }
+    }
+  let runtime = Runtime.make(pair.right, ~limits=limits(~maxBytes=64), ~handler=countingHandler)
+  let id = "replayed-direct-request"
+  currentSession(pair.rightEndpoint).message(
+    protocol(
+      "Request",
+      [("id", Obj.magic(id)), ("message", Obj.magic(Echo("x"->String.repeat(100))))],
+    ),
+    (),
+  )
+  currentSession(pair.rightEndpoint).message(
+    protocol("Request", [("id", Obj.magic(id)), ("message", Obj.magic(Echo("replay")))]),
+    (),
+  )
+  Runtime.close(runtime)
+  calls.contents === 0
+}
+
+let testMalformedChunkEnvelopeCannotLaterExecute = () => {
+  let pair = makePair()
+  let calls = ref(0)
+  let countingHandler = (_message, _sender, _context) => {
+    calls := calls.contents + 1
+    Response.none
+  }
+  let runtime = Runtime.make(pair.right, ~limits=limits(), ~handler=countingHandler)
+  let id = "malformed-chunk-envelope"
+  currentSession(pair.rightEndpoint).message(
+    protocol(
+      "RequestChunk",
+      [
+        ("id", Obj.magic(id)),
+        ("index", Obj.magic("invalid")),
+        ("total", Obj.magic(1)),
+        ("body", Obj.magic("{}")),
+      ],
+    ),
+    (),
+  )
+  currentSession(pair.rightEndpoint).message(
+    protocol("Request", [("id", Obj.magic(id)), ("message", Obj.magic(Echo("replay")))]),
+    (),
+  )
+  Runtime.close(runtime)
+  calls.contents === 0
+}
+
 let testInvalidChunkDoesNotDeleteExecution = async () => {
   let pair = makePair()
   let aborted = ref(0)
@@ -915,6 +1151,38 @@ let testInvalidChunkDoesNotDeleteExecution = async () => {
   Runtime.close(left)
   Runtime.close(right)
   rejected && aborted.contents === 1
+}
+
+let testMalformedRequestChunkCannotRejectExecution = async () => {
+  let pair = makePair()
+  let resolveResponse: ref<option<string => unit>> = ref(None)
+  let delayedHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) =>
+      switch message {
+      | Echo(_) =>
+        Response.later(Promise.make((resolve, _reject) => resolveResponse := Some(resolve)))
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=delayedHandler)
+  let pending = Runtime.sendMessage(left, Echo("original"))
+  let id = field(pair.leftEndpoint.posts.contents[0]->Option.getOrThrow, "id")
+  pair.leftEndpoint.deliver(
+    protocol(
+      "RequestChunk",
+      [("id", id), ("index", Obj.magic(0)), ("total", Obj.magic(1)), ("body", Obj.magic(""))],
+    ),
+  )
+  resolveResponse.contents->Option.forEach(resolve => resolve("original"))
+  let preserved = try {
+    (await pending) === "original"
+  } catch {
+  | _ => false
+  }
+  Runtime.close(left)
+  Runtime.close(right)
+  preserved
 }
 
 let testMalformedCorrelatedResponsesRejectImmediately = async () => {
@@ -1259,10 +1527,24 @@ let runTests = async () => {
       "replacement capability stays stale after Connecting close",
       testReplacementCapabilityStaysStaleAfterConnectingClose,
     ),
+    ("response serialization cannot cross sessions", testResponseSerializationCannotCrossSessions),
+    ("request serialization cannot replay", testRequestSerializationCannotReplay),
+    ("cast serialization cannot cross sessions", testCastSerializationCannotCrossSessions),
+    (
+      "outbound cast serialization cannot cross sessions",
+      testOutboundCastSerializationCannotCrossSessions,
+    ),
+    ("cast chunks cannot cross sessions", testCastChunksCannotCrossSessions),
+    ("invalid direct request cannot later execute", testInvalidDirectRequestCannotLaterExecute),
+    ("malformed chunk envelope cannot later execute", testMalformedChunkEnvelopeCannotLaterExecute),
     ("abort subscription observes existing abort", testAbortSubscriptionObservesExistingAbort),
   ]
   let asyncTests = [
     ("direct and chunked request/cast round trip", testDirectAndChunkedRoundTrip),
+    (
+      "outbound request serialization cannot cross sessions",
+      testOutboundRequestSerializationCannotCrossSessions,
+    ),
     ("chunk count uses one pending slot and timeout", testChunkedRequestUsesOnePendingSlot),
     ("pre-flight and in-flight abort", testPreAndInflightAbort),
     ("whenOpen waits for connection", testWhenOpenWaitsForConnection),
@@ -1283,9 +1565,14 @@ let runTests = async () => {
     ("chunks must arrive in exact order", testMalformedOrderedChunks),
     ("completed requests ignore direct and chunk replays", testCompletedRequestsIgnoreReplay),
     ("active direct replay keeps original request", testActiveDirectReplayKeepsOriginalRequest),
+    ("active chunk replay keeps original request", testActiveChunkReplayKeepsOriginalRequest),
     ("replay window evicts oldest request", testReplayWindowEvictsOldestRequest),
     ("malformed request cannot later execute", testMalformedRequestCannotLaterExecute),
     ("invalid chunk cannot delete active execution", testInvalidChunkDoesNotDeleteExecution),
+    (
+      "malformed request chunk cannot reject active execution",
+      testMalformedRequestChunkCannotRejectExecution,
+    ),
     (
       "malformed correlated responses reject immediately",
       testMalformedCorrelatedResponsesRejectImmediately,
