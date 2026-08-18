@@ -11,4 +11,8 @@ type Types.message<_> +=
   | GetNotice: Types.message<option<string>>
   | Fail: Types.message<string>
   | Never: Types.message<string>
-  | Uncloneable(Obj.t): Types.message<string>
+  | DelayedReverse(string): Types.message<string>
+  | AskDelayedReverse(string): Types.message<string>
+  | Cancellable: Types.message<string>
+  | GetCancellationCount: Types.message<int>
+  | GetCancellationStartCount: Types.message<int>

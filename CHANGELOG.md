@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Replace `Runtime.Make` and window transport functors with opaque, independently stateful transport and runtime values
+- Require `Runtime.make(transport, ~limits, ~handler)`; constructing the runtime consumes and starts the transport
+- Replace raw transport records with `Runtime.makeTransport` for single connections and `Runtime.makeDynamicTransport` for transport-managed reconnects
+- Replace listener collections and separate lifecycle callbacks with one handler, `Runtime.status`, and `Runtime.onStatus`
+- Add `Runtime.whenOpen` for race-safe asynchronous readiness
+- Pass `Runtime.Request(signal)` or `Runtime.Cast` to handlers and propagate request cancellation to the matching remote operation
+- Configure window transports with explicit origins and a channel; parent transports also require `subscribeLoad` and `connectionTimeoutMs`
+- Start parent and child window transports automatically when consumed instead of exposing `connect` or `listen`
+- Keep runtime limits (`requestTimeoutMs`, `maxMessageBytes`, and `maxPendingRequests`) separate from transport `maxChunkBytes`
+- Reserve enough message and chunk capacity for bounded protocol errors and one UTF-8 code point
+- Make transports single-consumption and runtime-owned; `Runtime.close` performs terminal teardown
+- Chunk oversized requests and casts using one logical ID, timeout, pending slot, and cancellation operation across all chunks
+- Require ordered transport delivery, reject malformed or oversized chunk sequences, and suppress bounded duplicate replays
+- Send responses directly without response chunking, while bounding response payloads with `maxMessageBytes`
+- Give each physical connection a runtime-owned session capability; connecting a replacement makes older session sinks stale and rejects their pending work
+- Use transferred ports as window connection identity instead of repeating handshake IDs on private port traffic
+- Canonicalize request, cast, and response payloads through JSON before dispatch
+- Restrict `Runtime.cast` to messages whose response type is `unit`; use `sendMessage` for response-bearing messages
+- Replace removed `isContextValid` checks with `Runtime.status(runtime) === Runtime.Open`
 - Upgrade the development compiler from ReScript 12 beta to ReScript 12.3
 - Support all stable ReScript 12 releases
 - Restrict the supported package surface to consumer-facing modules
@@ -19,20 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial implementation of type-safe Chrome extension message passing
 - GADT-based message system with compile-time type safety
-- Automatic message chunking for large payloads
-- Framework-agnostic Runtime.Make functor pattern
+- Automatic request and cast chunking for large payloads
+- Framework-agnostic value-level runtime API
 - Support for WXT and raw Chrome extension APIs
 - Comprehensive test suite with unit and integration tests
 - Zero runtime dependencies architecture
 
 ### Features
 - **Types.res**: Extensible GADT message type system
-- **Runtime.res**: Generic runtime wrapper with functor pattern
-- **TransportMessage.res**: Internal chunking system (invisible to users)
-- **MessageChunker.res**: Core chunking functionality with size limits
-- **RequestHandler.res**: Automatic chunk reassembly
+- **Runtime.res**: Generic value-level runtime with status, limits, teardown, and cancellation support
 - **Response.res**: Type-safe response patterns (immediate, async, none)
-- **Id.res**: UUID generation for chunk tracking
 
 ### Documentation
 - Comprehensive README with usage examples

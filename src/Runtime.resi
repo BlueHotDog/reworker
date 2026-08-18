@@ -3,29 +3,48 @@
  * SPDX-License-Identifier: MIT
  */
 
-module type RuntimeBindings = {
-  type sender
-  let requestTimeoutMs: int
-  let postMessage: 'a => result<unit, string>
-  module OnMessage: {
-    let addListener: (('a, sender) => unit) => unit
-    let removeListener: (('a, sender) => unit) => unit
-  }
-  module OnClose: {
-    let addListener: (string => unit) => unit
-  }
-  let isOpen: unit => bool
-  let close: unit => unit
+type session<'sender> = {
+  connecting: unit => unit,
+  opened: unit => unit,
+  message: (Obj.t, 'sender) => unit,
+  disconnected: string => unit,
 }
 
-module Make: (Bindings: RuntimeBindings) =>
-{
-  let sendMessage: Types.message<'a> => Promise.t<'a>
-  let cast: Types.message<'a> => unit
-  module OnMessage: {
-    let addListener: ((Types.message<'a>, Bindings.sender) => Response.t<'a>) => unit
-    let removeListener: ((Types.message<'a>, Bindings.sender) => Response.t<'a>) => unit
-  }
-  let isContextValid: unit => bool
-  let close: unit => unit
+type transport<'sender>
+type limits = {
+  requestTimeoutMs: int,
+  maxMessageBytes: int,
+  maxPendingRequests: int,
 }
+type context = Request(AbortSignal.t) | Cast
+type status = Connecting | Open | Disconnected(string) | Closed(string)
+type t<'sender>
+
+let makeTransport: (
+  ~postMessage: Obj.t => result<unit, string>,
+  ~subscribe: (~onMessage: (Obj.t, 'sender) => unit, ~onDisconnect: string => unit) => unit => unit,
+  ~maxChunkBytes: int,
+) => transport<'sender>
+
+let makeDynamicTransport: (
+  ~postMessage: Obj.t => result<unit, string>,
+  ~start: (~prepareSession: unit => session<'sender>) => unit,
+  ~close: unit => unit,
+  ~maxChunkBytes: int,
+) => transport<'sender>
+
+let make: (
+  transport<'sender>,
+  ~limits: limits,
+  ~handler: (Types.message<'response>, 'sender, context) => Response.t<'response>,
+) => t<'sender>
+let sendMessage: (
+  t<'sender>,
+  Types.message<'response>,
+  ~signal: AbortSignal.t=?,
+) => Promise.t<'response>
+let cast: (t<'sender>, Types.message<unit>) => unit
+let status: t<'sender> => status
+let onStatus: (t<'sender>, status => unit) => unit => unit
+let whenOpen: t<'sender> => Promise.t<unit>
+let close: t<'sender> => unit

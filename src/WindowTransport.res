@@ -3,417 +3,388 @@
  * SPDX-License-Identifier: MIT
  */
 
-let marker = "@bluehotdog/reworker/window/v1"
+let marker = "@bluehotdog/reworker/window/v2"
 
-type bootstrapMessage = {
-  marker: string,
-  kind: string,
-  connectionId: Id.t,
-}
+@scope("Number") @val external isSafeInteger: Obj.t => bool = "isSafeInteger"
+@scope("Object") @val external hasOwn: (Obj.t, string) => bool = "hasOwn"
+@val external errorToString: 'a => string = "String"
+@get external pageTransitionPersisted: Obj.t => bool = "persisted"
+
+type bootstrapMessage = {marker: string, kind: string, channel: string}
 
 type portMessage = {
-  marker: string,
   kind: string,
-  connectionId: Id.t,
-  payload: option<Obj.t>,
-  reason: option<string>,
+  payload?: Obj.t,
+  reason?: string,
 }
 
-type messageListener = (Obj.t, unit) => unit
+type incoming = Ready | Data(Obj.t) | RemoteClose(string) | Invalid
 
 type connection = {
+  session: Runtime.session<unit>,
   port: MessagePort.t,
-  id: Id.t,
-  mutable ready: bool,
+  ready: ref<bool>,
+  timeoutId: option<timeoutId>,
+  cleanup: unit => unit,
 }
 
-type endpoint = {
-  mutable connection: option<connection>,
-  messageListeners: ref<array<messageListener>>,
-  closeListeners: ref<array<string => unit>>,
+type state = Running(option<connection>) | Closed
+
+let exceptionMessage = error =>
+  error->JsExn.fromException->Option.flatMap(JsExn.message)->Option.getOr(errorToString(error))
+
+let validateEndpointConfig = (~origin, ~originName, ~channel) => {
+  if origin === "" || origin === "*" {
+    JsError.throwWithMessage(`${originName} must be an explicit origin`)
+  }
+  if channel === "" {
+    JsError.throwWithMessage("channel must not be empty")
+  }
 }
 
-let makeEndpoint = () => {
-  connection: None,
-  messageListeners: ref([]),
-  closeListeners: ref([]),
+let safely = callback => {
+  try {
+    callback()
+  } catch {
+  | _ => ()
+  }
 }
 
-let removeFirst = (listeners, listener) => {
-  let removed = ref(false)
-  listeners :=
-    listeners.contents->Array.filter(existing => {
-      if !removed.contents && existing === listener {
-        removed := true
-        false
-      } else {
-        true
-      }
-    })
-}
+let closePort = port => safely(() => MessagePort.close(port))
 
-let makePortMessage = (~kind, ~connectionId, ~payload=None, ~reason=None) => {
-  marker,
-  kind,
-  connectionId,
-  payload,
-  reason,
+let postPortMessage = (port, ~kind, ~payload=?, ~reason=?) => {
+  let message: portMessage = {kind, ?payload, ?reason}
+  MessagePort.postMessage(port, message)
 }
 
 let readPortMessage = value => {
   try {
     let message: portMessage = Obj.magic(value)
-    message.marker === marker ? Some(message) : None
+    switch message.kind {
+    | "ready" => Ready
+    | "data" if hasOwn(Obj.magic(message), "payload") =>
+      Data(message.payload->Option.getOr(Obj.magic(undefined)))
+    | "close"
+      if hasOwn(Obj.magic(message), "reason") &&
+      Type.typeof(Obj.magic(message.reason)) === #string =>
+      RemoteClose(message.reason->Option.getOr("Remote endpoint closed"))
+    | _ => Invalid
+    }
   } catch {
-  | _ => None
+  | _ => Invalid
   }
 }
 
-let notifyClosed = (endpoint, reason) => {
-  endpoint.closeListeners.contents->Array.forEach(listener => listener(reason))
+let isBootstrapMessage = (value, ~channel) => {
+  try {
+    let message: bootstrapMessage = Obj.magic(value)
+    message.marker === marker && message.kind === "connect" && message.channel === channel
+  } catch {
+  | _ => false
+  }
 }
 
-let disconnect = (endpoint, reason, ~notifyRemote) => {
-  switch endpoint.connection {
-  | None => ()
-  | Some(connection) => {
-      endpoint.connection = None
-      if notifyRemote {
-        try {
-          MessagePort.postMessage(
-            connection.port,
-            makePortMessage(~kind="close", ~connectionId=connection.id, ~reason=Some(reason)),
-          )
-        } catch {
-        | _ => ()
-        }
-      }
-      MessagePort.close(connection.port)
-      notifyClosed(endpoint, reason)
+let makeConnection = (~session, ~port, ~onMessage, ~onMessageError, ~timeoutId=None) => {
+  let cleanup = () => {
+    timeoutId->Option.forEach(clearTimeout)
+    safely(() => MessagePort.removeEventListener(port, "message", onMessage))
+    safely(() => MessagePort.removeEventListener(port, "messageerror", onMessageError))
+    closePort(port)
+  }
+  {session, port, ready: ref(false), timeoutId, cleanup}
+}
+
+let installConnection = (connection, onMessage, onMessageError) => {
+  MessagePort.addEventListener(connection.port, "message", onMessage)
+  MessagePort.addEventListener(connection.port, "messageerror", onMessageError)
+  MessagePort.start(connection.port)
+}
+
+let currentConnection = (state, session) => {
+  switch state.contents {
+  | Running(Some(connection)) if connection.session === session => Some(connection)
+  | Running(None | Some(_)) | Closed => None
+  }
+}
+
+let closeConnection = (connection, ~reason, ~notifyRemote) => {
+  if notifyRemote {
+    safely(() => postPortMessage(connection.port, ~kind="close", ~reason))
+  }
+  connection.cleanup()
+}
+
+let disconnectSession = (state, session, reason, ~notifyRemote) => {
+  currentConnection(state, session)->Option.forEach(connection => {
+    state := Running(None)
+    closeConnection(connection, ~reason, ~notifyRemote)
+    session.disconnected(reason)
+  })
+}
+
+let disconnectCurrent = (state, reason, ~notifyRemote) => {
+  switch state.contents {
+  | Running(Some(connection)) => disconnectSession(state, connection.session, reason, ~notifyRemote)
+  | Running(None) | Closed => ()
+  }
+}
+
+let receivePortMessage = (state, session, value, ~onReady) => {
+  currentConnection(state, session)->Option.forEach(connection => {
+    switch readPortMessage(value) {
+    | Ready if onReady(connection) => ()
+    | Data(payload) if connection.ready.contents => session.message(payload, ())
+    | RemoteClose(reason) => disconnectSession(state, session, reason, ~notifyRemote=false)
+    | Ready | Data(_) | Invalid =>
+      disconnectSession(state, session, "Received an invalid port message", ~notifyRemote=true)
     }
-  }
+  })
 }
 
-let isCurrentConnection = (endpoint, connection) => {
-  switch endpoint.connection {
-  | Some(current) => current === connection
-  | None => false
-  }
-}
+let receivePortError = (state, session) =>
+  disconnectSession(
+    state,
+    session,
+    "Message port could not deserialize a value",
+    ~notifyRemote=true,
+  )
 
-let activate = (endpoint, port, id, ~ready, ~onReady) => {
-  let connection = {port, id, ready}
-  endpoint.connection = Some(connection)
-
-  let onMessage = event => {
-    if isCurrentConnection(endpoint, connection) {
-      switch readPortMessage(MessageEvent.data(event)) {
-      | Some(message) if message.connectionId === id =>
-        switch message.kind {
-        | "ready" => onReady()
-        | "data" if connection.ready =>
-          switch message.payload {
-          | Some(payload) =>
-            endpoint.messageListeners.contents->Array.forEach(listener => listener(payload, ()))
-          | None => disconnect(endpoint, "Received an invalid port message", ~notifyRemote=true)
-          }
-        | "close" =>
-          disconnect(
-            endpoint,
-            message.reason->Option.getOr("Remote endpoint closed"),
-            ~notifyRemote=false,
-          )
-        | _ => ()
-        }
-      | Some(_) => ()
-      | None => disconnect(endpoint, "Received an invalid port message", ~notifyRemote=true)
-      }
-    }
-  }
-  let onMessageError = _event => {
-    if isCurrentConnection(endpoint, connection) {
-      disconnect(endpoint, "Message port could not deserialize a value", ~notifyRemote=true)
-    }
-  }
-
-  MessagePort.addEventListener(port, "message", onMessage)
-  MessagePort.addEventListener(port, "messageerror", onMessageError)
-  MessagePort.start(port)
-}
-
-let markReady = endpoint => {
-  switch endpoint.connection {
-  | Some(connection) => connection.ready = true
-  | None => ()
-  }
-}
-
-let post = (endpoint, message) => {
-  switch endpoint.connection {
-  | Some(connection) if connection.ready =>
-    try {
-      MessagePort.postMessage(
-        connection.port,
-        makePortMessage(
-          ~kind="data",
-          ~connectionId=connection.id,
-          ~payload=Some(Obj.magic(message)),
-        ),
+let closeTransport = (state, cleanup) => {
+  switch state.contents {
+  | Closed => ()
+  | Running(connection) => {
+      state := Closed
+      connection->Option.forEach(connection =>
+        closeConnection(connection, ~reason="Window transport closed", ~notifyRemote=true)
       )
+      safely(cleanup)
+    }
+  }
+}
+
+let postData = (state, payload) => {
+  switch state.contents {
+  | Running(Some(connection)) if connection.ready.contents =>
+    try {
+      postPortMessage(connection.port, ~kind="data", ~payload)
       Ok()
     } catch {
-    | error =>
-      Error(
-        error
-        ->JsExn.fromException
-        ->Option.flatMap(JsExn.message)
-        ->Option.getOr("Message could not be cloned"),
-      )
+    | error => Error(exceptionMessage(error))
     }
-  | Some(_) => Error("Window transport is not ready")
-  | None => Error("Window transport is closed")
-  }
-}
-
-let isOpen = endpoint => {
-  switch endpoint.connection {
-  | Some(connection) => connection.ready
-  | None => false
+  | Running(None | Some(_)) => Error("Window transport is not connected")
+  | Closed => Error("Window transport is closed")
   }
 }
 
 module Parent = {
-  module Make = (
-    Config: {
-      type targetWindow
-      type loadEvent
-      let targetOrigin: string
-      let targetWindow: unit => targetWindow
-      let addLoadListener: (loadEvent => unit) => unit
-      let removeLoadListener: (loadEvent => unit) => unit
-      let requestTimeoutMs: int
-    },
-  ) => {
-    type sender = unit
-
-    type connectionAttempt = {
-      id: Id.t,
-      resolve: unit => unit,
-      reject: JsError.t => unit,
-      timeoutId: timeoutId,
-    }
-
-    let requestTimeoutMs = Config.requestTimeoutMs
-    let endpoint = makeEndpoint()
-    let attempt: ref<option<connectionAttempt>> = ref(None)
-    let listeningForLoads = ref(false)
-    let reconnect = ref(() => ())
-
-    let rejectAttempt = reason => {
-      switch attempt.contents {
-      | Some(current) => {
-          clearTimeout(current.timeoutId)
-          attempt := None
-          current.reject(JsError.make(reason))
-        }
-      | None => ()
-      }
-    }
-
-    endpoint.closeListeners := endpoint.closeListeners.contents->Array.concat([rejectAttempt])
-
-    let closeConnection = reason => {
-      rejectAttempt(reason)
-      disconnect(endpoint, reason, ~notifyRemote=true)
-    }
-
-    let loadHandler = _event => reconnect.contents()
-
-    let rejectPromise = message => {
-      Promise.make((_resolve, reject) => reject(JsError.make(message)))
-    }
-
-    let connect = () => {
-      if Config.targetOrigin === "" || Config.targetOrigin === "*" {
-        rejectPromise("targetOrigin must be an explicit origin")
-      } else {
-        if !listeningForLoads.contents {
-          listeningForLoads := true
-          Config.addLoadListener(loadHandler)
-        }
-        closeConnection("Iframe navigation replaced the connection")
-
-        let targetWindow = Config.targetWindow()
-        let id = Id.make()
-        let channel = MessageChannel.make()
-        let port = MessageChannel.port1(channel)
-        Promise.make((resolve, reject) => {
-          let timeoutId = setTimeout(() => {
-            rejectAttempt("Window transport readiness timed out")
-            disconnect(endpoint, "Window transport readiness timed out", ~notifyRemote=true)
-          }, Config.requestTimeoutMs)
-          attempt := Some({id, resolve, reject, timeoutId})
-
-          activate(endpoint, port, id, ~ready=false, ~onReady=() => {
-            switch attempt.contents {
-            | Some(current) if current.id === id => {
-                clearTimeout(current.timeoutId)
-                attempt := None
-                markReady(endpoint)
-                current.resolve()
-              }
-            | Some(_) | None => ()
-            }
-          })
-
-          try {
-            let bootstrap = {marker, kind: "connect", connectionId: id}
-            BrowserWindow.postMessage(
-              Obj.magic(targetWindow),
-              bootstrap,
-              Config.targetOrigin,
-              [MessageChannel.port2(channel)],
-            )
-          } catch {
-          | error => {
-              let reason =
-                error
-                ->JsExn.fromException
-                ->Option.flatMap(JsExn.message)
-                ->Option.getOr("Failed to transfer the message port")
-              rejectAttempt(reason)
-              disconnect(endpoint, reason, ~notifyRemote=false)
-            }
-          }
-        })
-      }
-    }
-
-    reconnect :=
-      (
-        () => {
-          closeConnection("Iframe reloaded")
-          connect()->Promise.catch(_ => Promise.resolve())->ignore
-        }
-      )
-
-    let postMessage = message => post(endpoint, message)
-
-    module OnMessage = {
-      let addListener = listener => {
-        endpoint.messageListeners :=
-          endpoint.messageListeners.contents->Array.concat([Obj.magic(listener)])
-      }
-      let removeListener = listener => {
-        removeFirst(endpoint.messageListeners, Obj.magic(listener))
-      }
-    }
-
-    module OnClose = {
-      let addListener = listener => {
-        endpoint.closeListeners := endpoint.closeListeners.contents->Array.concat([listener])
-      }
-    }
-
-    let isOpen = () => isOpen(endpoint)
-
-    let close = () => {
-      if listeningForLoads.contents {
-        listeningForLoads := false
-        Config.removeLoadListener(loadHandler)
-      }
-      closeConnection("Window transport closed")
-    }
+  type config<'targetWindow> = {
+    targetWindow: 'targetWindow,
+    targetOrigin: string,
+    channel: string,
+    subscribeLoad: (unit => unit) => unit => unit,
+    connectionTimeoutMs: int,
+    maxChunkBytes: int,
   }
-}
 
-module Child = {
-  module Make = (
-    Config: {
-      type parentWindow
-      let parentWindow: parentWindow
-      let parentOrigin: string
-      let requestTimeoutMs: int
-    },
-  ) => {
-    type sender = unit
+  let make = config => {
+    validateEndpointConfig(
+      ~origin=config.targetOrigin,
+      ~originName="targetOrigin",
+      ~channel=config.channel,
+    )
+    if !isSafeInteger(Obj.magic(config.connectionTimeoutMs)) || config.connectionTimeoutMs <= 0 {
+      JsError.throwWithMessage("connectionTimeoutMs is invalid")
+    }
 
-    let requestTimeoutMs = Config.requestTimeoutMs
-    let endpoint = makeEndpoint()
-    let listening = ref(false)
+    let state = ref(Running(None))
+    let cleanup = ref(() => ())
+    let postMessage = payload => postData(state, payload)
+    let close = () => closeTransport(state, cleanup.contents)
 
-    let onBootstrapMessage = event => {
-      let sourceMatches = MessageEvent.source(event) === Obj.magic(Config.parentWindow)
-
-      if MessageEvent.origin(event) === Config.parentOrigin && sourceMatches {
-        try {
-          let bootstrap: bootstrapMessage = Obj.magic(MessageEvent.data(event))
-          if bootstrap.marker === marker && bootstrap.kind === "connect" {
-            switch MessageEvent.ports(event)->Array.get(0) {
-            | Some(port) => {
-                disconnect(endpoint, "Parent replaced the connection", ~notifyRemote=false)
-                activate(endpoint, port, bootstrap.connectionId, ~ready=true, ~onReady=() => ())
-                try {
-                  MessagePort.postMessage(
-                    port,
-                    makePortMessage(~kind="ready", ~connectionId=bootstrap.connectionId),
-                  )
-                } catch {
-                | _ =>
-                  disconnect(
-                    endpoint,
-                    "Failed to confirm window transport readiness",
-                    ~notifyRemote=true,
-                  )
+    let start = (~prepareSession) => {
+      let startConnection = () => {
+        switch state.contents {
+        | Closed | Running(Some(_)) => ()
+        | Running(None) => {
+            let channel = MessageChannel.make()
+            let port = MessageChannel.port1(channel)
+            let remotePort = MessageChannel.port2(channel)
+            let session = prepareSession()
+            let onMessage = event =>
+              receivePortMessage(state, session, MessageEvent.data(event), ~onReady=connection => {
+                if connection.ready.contents {
+                  false
+                } else {
+                  connection.timeoutId->Option.forEach(clearTimeout)
+                  connection.ready := true
+                  session.opened()
+                  true
                 }
+              })
+            let onMessageError = _event => receivePortError(state, session)
+            let timeoutId = setTimeout(
+              () =>
+                disconnectSession(
+                  state,
+                  session,
+                  "Window transport readiness timed out",
+                  ~notifyRemote=true,
+                ),
+              config.connectionTimeoutMs,
+            )
+            let connection = makeConnection(
+              ~session,
+              ~port,
+              ~onMessage,
+              ~onMessageError,
+              ~timeoutId=Some(timeoutId),
+            )
+            state := Running(Some(connection))
+            try {
+              installConnection(connection, onMessage, onMessageError)
+              let bootstrap: bootstrapMessage = {marker, kind: "connect", channel: config.channel}
+              BrowserWindow.postMessage(
+                Obj.magic(config.targetWindow),
+                bootstrap,
+                config.targetOrigin,
+                [remotePort],
+              )
+              session.connecting()
+            } catch {
+            | error => {
+                closePort(remotePort)
+                disconnectSession(state, session, exceptionMessage(error), ~notifyRemote=false)
+                JsError.throw(Obj.magic(error))
               }
-            | None => ()
             }
           }
+        }
+      }
+
+      let onLoad = () => {
+        disconnectCurrent(state, "Iframe reloaded", ~notifyRemote=true)
+        try {
+          startConnection()
         } catch {
         | _ => ()
         }
       }
-    }
 
-    let listen = () => {
-      if Config.parentOrigin === "" || Config.parentOrigin === "*" {
-        Error("parentOrigin must be an explicit origin")
-      } else if listening.contents {
-        Ok()
-      } else {
-        listening := true
-        BrowserWindow.addEventListener(BrowserWindow.current, "message", onBootstrapMessage)
-        Ok()
+      let remove = config.subscribeLoad(onLoad)
+      switch state.contents {
+      | Closed => remove()
+      | Running(_) => {
+          cleanup := remove
+          startConnection()
+        }
       }
     }
 
-    let postMessage = message => post(endpoint, message)
+    Runtime.makeDynamicTransport(~postMessage, ~start, ~close, ~maxChunkBytes=config.maxChunkBytes)
+  }
+}
 
-    module OnMessage = {
-      let addListener = listener => {
-        endpoint.messageListeners :=
-          endpoint.messageListeners.contents->Array.concat([Obj.magic(listener)])
+module Child = {
+  type config<'parentWindow> = {
+    parentWindow: 'parentWindow,
+    parentOrigin: string,
+    channel: string,
+    maxChunkBytes: int,
+  }
+
+  let make = config => {
+    validateEndpointConfig(
+      ~origin=config.parentOrigin,
+      ~originName="parentOrigin",
+      ~channel=config.channel,
+    )
+
+    let state = ref(Running(None))
+    let cleanup = ref(() => ())
+    let postMessage = payload => postData(state, payload)
+    let close = () => closeTransport(state, cleanup.contents)
+
+    let start = (~prepareSession) => {
+      let onBootstrapMessage = event => {
+        if (
+          MessageEvent.origin(event) === config.parentOrigin &&
+            MessageEvent.source(event) === Obj.magic(config.parentWindow)
+        ) {
+          switch (
+            isBootstrapMessage(MessageEvent.data(event), ~channel=config.channel),
+            MessageEvent.ports(event)->Array.get(0),
+          ) {
+          | (true, Some(port)) => {
+              disconnectCurrent(state, "Parent replaced the connection", ~notifyRemote=false)
+              switch state.contents {
+              | Closed | Running(Some(_)) => closePort(port)
+              | Running(None) => {
+                  let session = prepareSession()
+                  let onMessage = portEvent =>
+                    receivePortMessage(state, session, MessageEvent.data(portEvent), ~onReady=_ =>
+                      false
+                    )
+                  let onMessageError = _event => receivePortError(state, session)
+                  let connection = makeConnection(~session, ~port, ~onMessage, ~onMessageError)
+                  state := Running(Some(connection))
+                  try {
+                    installConnection(connection, onMessage, onMessageError)
+                    postPortMessage(port, ~kind="ready")
+                    connection.ready := true
+                    session.connecting()
+                    session.opened()
+                  } catch {
+                  | error => {
+                      session.connecting()
+                      disconnectSession(
+                        state,
+                        session,
+                        exceptionMessage(error),
+                        ~notifyRemote=false,
+                      )
+                    }
+                  }
+                }
+              }
+            }
+          | _ => ()
+          }
+        }
       }
-      let removeListener = listener => {
-        removeFirst(endpoint.messageListeners, Obj.magic(listener))
+      let onPageHide = event => {
+        if !pageTransitionPersisted(event) {
+          disconnectCurrent(state, "Child window unloading", ~notifyRemote=true)
+        }
+      }
+
+      BrowserWindow.addEventListener(BrowserWindow.current, "message", onBootstrapMessage)
+      try {
+        BrowserWindow.addEventListener(BrowserWindow.current, "pagehide", onPageHide)
+        cleanup :=
+          (
+            () => {
+              safely(() =>
+                BrowserWindow.removeEventListener(
+                  BrowserWindow.current,
+                  "message",
+                  onBootstrapMessage,
+                )
+              )
+              safely(() =>
+                BrowserWindow.removeEventListener(BrowserWindow.current, "pagehide", onPageHide)
+              )
+            }
+          )
+      } catch {
+      | error => {
+          safely(() =>
+            BrowserWindow.removeEventListener(BrowserWindow.current, "message", onBootstrapMessage)
+          )
+          JsError.throw(Obj.magic(error))
+        }
       }
     }
 
-    module OnClose = {
-      let addListener = listener => {
-        endpoint.closeListeners := endpoint.closeListeners.contents->Array.concat([listener])
-      }
-    }
-
-    let isOpen = () => isOpen(endpoint)
-
-    let close = () => {
-      if listening.contents {
-        listening := false
-        BrowserWindow.removeEventListener(BrowserWindow.current, "message", onBootstrapMessage)
-      }
-      disconnect(endpoint, "Window transport closed", ~notifyRemote=true)
-    }
+    Runtime.makeDynamicTransport(~postMessage, ~start, ~close, ~maxChunkBytes=config.maxChunkBytes)
   }
 }

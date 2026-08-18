@@ -48,9 +48,8 @@ let runAllTests = async () => {
 
   // Run all test suites
   runSuite("MessageChunker Unit Tests", MessageChunker__test.main)
-  runSuite("TransportMessage Unit Tests", TransportMessage__test.main)
   await runAsyncSuite("Response Unit Tests", Response__test.main)
-  await runAsyncSuite("Runtime Integration Tests", Runtime__test.main)
+  await runAsyncSuite("Runtime Contract Tests", Runtime__test.main)
 
   // Calculate elapsed time
   let endTime = Date.now()

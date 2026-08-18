@@ -9,3 +9,4 @@ type t
 @send external close: t => unit = "close"
 @send external postMessage: (t, 'a) => unit = "postMessage"
 @send external addEventListener: (t, string, 'event => unit) => unit = "addEventListener"
+@send external removeEventListener: (t, string, 'event => unit) => unit = "removeEventListener"
