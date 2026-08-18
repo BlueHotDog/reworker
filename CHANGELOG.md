@@ -22,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Chunk oversized requests and casts using one logical ID, timeout, pending slot, and cancellation operation across all chunks
 - Require ordered transport delivery, reject malformed or oversized chunk sequences, and suppress bounded duplicate replays
 - Send responses directly without response chunking, while bounding response payloads with `maxMessageBytes`
-- Give each physical connection a runtime-owned session capability; beginning a replacement makes older session sinks stale and rejects their pending work
-- Keep window handshake IDs private to `WindowTransport`; custom transports no longer generate, expose, or retain runtime session identifiers
+- Give each physical connection a runtime-owned session capability; connecting a replacement makes older session sinks stale and rejects their pending work
+- Use transferred ports as window connection identity instead of repeating handshake IDs on private port traffic
 - Canonicalize request, cast, and response payloads through JSON before dispatch
 - Restrict `Runtime.cast` to messages whose response type is `unit`; use `sendMessage` for response-bearing messages
 - Replace removed `isContextValid` checks with `Runtime.status(runtime) === Runtime.Open`

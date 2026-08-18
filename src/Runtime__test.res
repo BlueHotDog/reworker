@@ -14,7 +14,7 @@ type Types.message<_> +=
   | ThrowUnstringifiable: Types.message<string>
 
 type endpoint = {
-  beginSession: ref<option<unit => Runtime.session<unit>>>,
+  prepareSession: ref<option<unit => Runtime.session<unit>>>,
   session: ref<option<Runtime.session<unit>>>,
   posts: ref<array<Obj.t>>,
   autoDeliver: ref<bool>,
@@ -32,7 +32,7 @@ type pair = {
 }
 
 let makeEndpoint = () => {
-  beginSession: ref(None),
+  prepareSession: ref(None),
   session: ref(None),
   posts: ref([]),
   autoDeliver: ref(true),
@@ -43,9 +43,10 @@ let makeEndpoint = () => {
 }
 
 let beginEndpointSession = endpoint => {
-  let beginSession = endpoint.beginSession.contents->Option.getOrThrow
-  let session = beginSession()
+  let prepareSession = endpoint.prepareSession.contents->Option.getOrThrow
+  let session = prepareSession()
   endpoint.session := Some(session)
+  session.Runtime.connecting()
   session
 }
 
@@ -73,22 +74,22 @@ let makePair = (~maxChunkBytes=64, ~rightMaxChunkBytes=maxChunkBytes, ~openOnSta
           Ok()
         }
       },
-      ~start=(~beginSession) => {
-        endpoint.beginSession := Some(beginSession)
+      ~start=(~prepareSession) => {
+        endpoint.prepareSession := Some(prepareSession)
         let session = beginEndpointSession(endpoint)
         if openOnStart {
           session.opened()
         }
+      },
+      ~close=() => {
         let tornDown = ref(false)
-        () => {
-          if !tornDown.contents {
-            tornDown := true
-            endpoint.teardownCount := endpoint.teardownCount.contents + 1
-            endpoint.beginSession := None
-            endpoint.session := None
-            if endpoint.teardownThrows.contents {
-              JsError.throwWithMessage("teardown failed")
-            }
+        if !tornDown.contents {
+          tornDown := true
+          endpoint.teardownCount := endpoint.teardownCount.contents + 1
+          endpoint.prepareSession := None
+          endpoint.session := None
+          if endpoint.teardownThrows.contents {
+            JsError.throwWithMessage("teardown failed")
           }
         }
       },
@@ -258,16 +259,17 @@ let testTransportSingleConsumption = () => {
   rejected
 }
 
-let testTransportRejectsUnsafeChunkCap = () => throwsWith(() =>
-    Runtime.makeDynamicTransport(
-      ~maxChunkBytes=3,
-      ~postMessage=_ => Ok(),
-      ~start=(~beginSession) => {
-        beginSession->ignore
-        () => ()
-      },
-    )->ignore
-  , "maxChunkBytes is invalid")
+let testTransportRejectsUnsafeChunkCap = () =>
+  throwsWith(
+    () =>
+      Runtime.makeDynamicTransport(
+        ~maxChunkBytes=3,
+        ~postMessage=_ => Ok(),
+        ~start=(~prepareSession) => prepareSession->ignore,
+        ~close=() => (),
+      )->ignore,
+    "maxChunkBytes is invalid",
+  )
 
 let testRuntimeRejectsUnsafeMessageLimit = () => {
   let pair = makePair()
@@ -278,13 +280,15 @@ let testRuntimeRejectsUnsafeMessageLimit = () => {
 }
 
 let testStartFailureConsumesTransport = () => {
+  let closeCount = ref(0)
   let transport = Runtime.makeDynamicTransport(
     ~maxChunkBytes=64,
     ~postMessage=_ => Ok(),
-    ~start=(~beginSession) => {
-      beginSession->ignore
+    ~start=(~prepareSession) => {
+      prepareSession->ignore
       JsError.throwWithMessage("start failed")
     },
+    ~close=() => closeCount := closeCount.contents + 1,
   )
   let startFailed = throwsWith(
     () => Runtime.make(transport, ~limits=limits(), ~handler=inertHandler)->ignore,
@@ -294,7 +298,43 @@ let testStartFailureConsumesTransport = () => {
     () => Runtime.make(transport, ~limits=limits(), ~handler=inertHandler)->ignore,
     "already been consumed",
   )
-  startFailed && ownershipStayedTransferred
+  startFailed && ownershipStayedTransferred && closeCount.contents === 1
+}
+
+let testPreparedSessionIsInertUntilConnecting = () => {
+  let pair = makePair()
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=inertHandler)
+  let prepareSession = pair.leftEndpoint.prepareSession.contents->Option.getOrThrow
+  let prepared: Runtime.session<unit> = prepareSession()
+  let stayedOpen = Runtime.status(runtime) === Runtime.Open
+  prepared.connecting()
+  let becameConnecting = Runtime.status(runtime) === Runtime.Connecting
+  Runtime.close(runtime)
+  stayedOpen && becameConnecting
+}
+
+let testLatestPreparedSessionWins = () => {
+  let pair = makePair()
+  let handled = ref(0)
+  let runtime = Runtime.make(pair.left, ~limits=limits(), ~handler=(
+    _message,
+    _sender,
+    _context,
+  ) => {
+    handled := handled.contents + 1
+    Response.none
+  })
+  let prepareSession = pair.leftEndpoint.prepareSession.contents->Option.getOrThrow
+  let older = prepareSession()
+  let newer = prepareSession()
+  newer.connecting()
+  newer.opened()
+  older.connecting()
+  older.opened()
+  older.message(protocol("Cast", [("_0", Obj.magic(Notice("stale")))]), ())
+  let passed = Runtime.status(runtime) === Runtime.Open && handled.contents === 0
+  Runtime.close(runtime)
+  passed
 }
 
 let testReplacementSessionCapabilitiesAreStale = () => {
@@ -309,6 +349,8 @@ let testReplacementSessionCapabilitiesAreStale = () => {
   staleSession.opened()
   let staleOpenIgnored = Runtime.status(right) === Runtime.Connecting
   current.opened()
+  staleSession.connecting()
+  staleSession.opened()
   staleSession.message(payload, ())
   staleSession.disconnected("stale disconnect")
   let passed =
@@ -1164,6 +1206,11 @@ let runTests = async () => {
     ("transport rejects unsafe chunk cap", testTransportRejectsUnsafeChunkCap),
     ("runtime rejects unsafe message limit", testRuntimeRejectsUnsafeMessageLimit),
     ("start failure preserves transferred ownership", testStartFailureConsumesTransport),
+    (
+      "prepared session stays inert until Connecting commit",
+      testPreparedSessionIsInertUntilConnecting,
+    ),
+    ("latest prepared session owns Connecting commit", testLatestPreparedSessionWins),
     ("replacement session capabilities become stale", testReplacementSessionCapabilitiesAreStale),
     ("pre-open messages are ignored", testPreOpenMessageIgnored),
     ("close is terminal and exception-safe", testTerminalClose),

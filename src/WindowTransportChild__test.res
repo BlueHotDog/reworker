@@ -85,15 +85,14 @@ let secondaryHandler:
     }
   }
 
-let dispatchBootstrap = (channelName, connectionId, port) => {
+let dispatchBootstrap = (channelName, port) => {
   let eventInit: Dict.t<Obj.t> = Dict.make()
   eventInit->Dict.set(
     "data",
     Obj.magic({
-      "marker": "@bluehotdog/reworker/window/v1",
+      "marker": "@bluehotdog/reworker/window/v2",
       "kind": "connect",
       "channel": channelName,
-      "connectionId": connectionId,
     }),
   )
   eventInit->Dict.set("origin", Obj.magic("http://127.0.0.1:4173"))
@@ -111,7 +110,7 @@ let testConnectionSetupFailureDisconnectsRuntime = (channelName, failingMethod) 
     failingMethod,
     Obj.magic(_value => JsError.throwWithMessage("connection setup failed")),
   )
-  dispatchBootstrap(channelName, `${channelName}-id`, childPort)
+  dispatchBootstrap(channelName, childPort)
   switch Runtime.status(failedRuntime) {
   | Runtime.Disconnected(_) => Runtime.close(failedRuntime)
   | Runtime.Connecting | Runtime.Open | Runtime.Closed(_) =>
@@ -123,52 +122,35 @@ let testConnectionSetupFailureDisconnectsRuntime = (channelName, failingMethod) 
 testConnectionSetupFailureDisconnectsRuntime("install-failure", "addEventListener")
 testConnectionSetupFailureDisconnectsRuntime("ready-failure", "postMessage")
 
-let testPrivateHandshakeAndStaleSessionIsolation = async () => {
+let testStaleSessionIsolation = async () => {
   let channelName = "session-isolation"
-  let oldHandshakeId = "private-old-handshake"
-  let newHandshakeId = "private-new-handshake"
-  let statusLog = []
   let disconnectedCount = ref(0)
   let testRuntime = Runtime.make(makeTransport(channelName), ~limits, ~handler=secondaryHandler)
   Runtime.onStatus(testRuntime, status => {
-    let label = switch status {
-    | Runtime.Connecting => "connecting"
-    | Runtime.Open => "open"
-    | Runtime.Disconnected(reason) => {
-        disconnectedCount := disconnectedCount.contents + 1
-        `disconnected:${reason}`
-      }
-    | Runtime.Closed(reason) => `closed:${reason}`
+    switch status {
+    | Runtime.Disconnected(_) => disconnectedCount := disconnectedCount.contents + 1
+    | Runtime.Connecting | Runtime.Open | Runtime.Closed(_) => ()
     }
-    statusLog->Array.push(label)->ignore
   })->ignore
 
   let oldChannel = MessageChannel.make()
   let newChannel = MessageChannel.make()
-  dispatchBootstrap(channelName, oldHandshakeId, MessageChannel.port1(oldChannel))
+  dispatchBootstrap(channelName, MessageChannel.port1(oldChannel))
   MessagePort.postMessage(
     MessageChannel.port2(oldChannel),
     Obj.magic({
-      "marker": "@bluehotdog/reworker/window/v1",
       "kind": "close",
-      "channel": channelName,
-      "connectionId": oldHandshakeId,
       "reason": "stale old port",
     }),
   )
-  dispatchBootstrap(channelName, newHandshakeId, MessageChannel.port1(newChannel))
+  dispatchBootstrap(channelName, MessageChannel.port1(newChannel))
   await Promise.make((resolve, _reject) => setTimeout(resolve, 20)->ignore)
 
   let remainsOpen = switch Runtime.status(testRuntime) {
   | Runtime.Open => true
   | Runtime.Connecting | Runtime.Disconnected(_) | Runtime.Closed(_) => false
   }
-  let statuses = statusLog->Array.join("|")
-  let passed =
-    remainsOpen &&
-    disconnectedCount.contents === 1 &&
-    !(statuses->String.includes(oldHandshakeId)) &&
-    !(statuses->String.includes(newHandshakeId))
+  let passed = remainsOpen && disconnectedCount.contents === 1
   Runtime.close(testRuntime)
   MessagePort.close(MessageChannel.port2(oldChannel))
   MessagePort.close(MessageChannel.port2(newChannel))
@@ -180,7 +162,7 @@ let reentrantRuntime = Runtime.make(makeTransport("reentrant"), ~limits, ~handle
 let staleRuntime = Runtime.make(makeTransport("stale"), ~limits, ~handler=secondaryHandler)
 
 let api: Dict.t<Obj.t> = Dict.make()
-api->Dict.set("sessionIsolation", Obj.magic(() => testPrivateHandshakeAndStaleSessionIsolation()))
+api->Dict.set("sessionIsolation", Obj.magic(() => testStaleSessionIsolation()))
 api->Dict.set(
   "invalidOrigin",
   Obj.magic(origin =>

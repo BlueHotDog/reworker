@@ -192,9 +192,9 @@ fields being omitted.
 `window.postMessage`, validates source window, and transfers `MessagePort`.
 Subsequent protocol traffic uses that ordered port.
 
-Window handshake IDs are private implementation details for bootstrap and port
-correlation. They are not exposed as transport lifecycle identity; Runtime owns
-session identity through `beginSession` capabilities.
+The transferred port is the established connection identity. Runtime owns logical
+session identity; no window handshake identifier is exposed or repeated on port
+traffic.
 
 Parent and child must use same non-empty `channel`. Channel isolates independent
 runtimes that share same parent and child windows. Concurrent endpoint pairs
@@ -268,16 +268,16 @@ before throwing because no teardown was returned.
 ### Dynamic Transports
 
 Only transport implementations that manage physical reconnects need
-`Runtime.makeDynamicTransport`. Its `start` callback receives `beginSession`.
-Call `beginSession()` once per physical connection, then report lifecycle through
-returned `opened`, `message`, and `disconnected` functions. A new session makes
-older callbacks inert.
+`Runtime.makeDynamicTransport`. Its `start` callback receives `prepareSession`.
+Call `prepareSession()` once per physical connection, install and commit physical
+resources, then call `session.connecting()`. Report later lifecycle events through
+`opened`, `message`, and `disconnected`. A prepared session is inert until
+`connecting()` and older session callbacks become inert when a replacement connects.
 
-`beginSession()` publishes `Runtime.Connecting` synchronously. Recheck transport
-state before installing resources because status listeners can close runtime
-during this callback. `start` must return one teardown that releases current
-connection and listener resources without retaining old session disposers. If
-`start` throws after acquiring resources, it must release them before throwing.
+Pass teardown separately as `close`; Runtime installs it before calling `start` and
+calls it if startup throws. Status listeners can close Runtime during
+`session.connecting()`, so all physical resources must already belong to transport
+state at that point.
 
 Custom transport must preserve callback and chunk order. Runtime does not sort
 chunks or acknowledge individual chunks.

@@ -61,10 +61,9 @@ document.querySelector("iframe").addEventListener("load", () => {
 	const channel = new MessageChannel()
 	channel.port1.onmessage = () => { window.attackReady = true }
 	document.querySelector("iframe").contentWindow.postMessage({
-		marker: "@bluehotdog/reworker/window/v1",
+		marker: "@bluehotdog/reworker/window/v2",
 		kind: "connect",
 		channel: "main",
-		connectionId: "wrong-origin",
 	}, "http://${host}:${childPort}", [channel.port2])
 })
 </script>`
@@ -86,10 +85,9 @@ window.forge = target => {
 	const channel = new MessageChannel()
 	channel.port1.onmessage = () => { parent.attackReady = true }
 	target.postMessage({
-		marker: "@bluehotdog/reworker/window/v1",
+		marker: "@bluehotdog/reworker/window/v2",
 		kind: "connect",
 		channel: "main",
-		connectionId: "wrong-source",
 	}, "http://${host}:${childPort}", [channel.port2])
 }
 </script>`
@@ -143,7 +141,7 @@ try {
 		try { await window.reworkerChildTest.invalidOrigin(""); return "resolved" } catch (error) { return String(error) }
 	})
 	assert(invalidChildOrigin.includes("explicit origin"), "child accepted empty origin")
-	assert(await childFrame.evaluate(() => window.reworkerChildTest.sessionIsolation()), "private handshake ID leaked or stale session affected replacement")
+	assert(await childFrame.evaluate(() => window.reworkerChildTest.sessionIsolation()), "stale port affected replacement session")
 	await page.waitForFunction(() => window.reworkerTest.allOpen())
 	assert(JSON.stringify(await page.evaluate(() => window.reworkerTest.lifecycleCounts())) === JSON.stringify([1, 1, 0]), "initial replacement lifecycle events were incorrect")
 	await page.waitForFunction(() => window.reworkerTest.childOpenNotices() === 2)

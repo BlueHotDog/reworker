@@ -4,6 +4,7 @@
  */
 
 type session<'sender> = {
+  connecting: unit => unit,
   opened: unit => unit,
   message: (Obj.t, 'sender) => unit,
   disconnected: string => unit,
@@ -11,7 +12,8 @@ type session<'sender> = {
 
 type transport<'sender> = {
   postMessage: Obj.t => result<unit, string>,
-  start: (~beginSession: unit => session<'sender>) => unit => unit,
+  start: (~prepareSession: unit => session<'sender>) => unit,
+  close: unit => unit,
   maxChunkBytes: int,
   consumed: ref<bool>,
 }
@@ -70,6 +72,7 @@ type t<'sender> = {
   settledOrder: ref<array<Id.t>>,
   settledIndex: ref<int>,
   statusListeners: ref<array<status => unit>>,
+  latestPreparedSessionToken: ref<option<sessionToken>>,
   currentSessionToken: ref<option<sessionToken>>,
   currentStatus: ref<status>,
   assemblyBytes: ref<int>,
@@ -91,19 +94,31 @@ let exceptionMessage = error => {
   }
 }
 
-let makeDynamicTransport = (~postMessage, ~start, ~maxChunkBytes) => {
+let makeDynamicTransport = (~postMessage, ~start, ~close, ~maxChunkBytes) => {
   if !isSafeInteger(Obj.magic(maxChunkBytes)) || maxChunkBytes < 4 {
     JsError.throwWithMessage("Transport maxChunkBytes is invalid")
   }
-  {postMessage, start, maxChunkBytes, consumed: ref(false)}
+  {postMessage, start, close, maxChunkBytes, consumed: ref(false)}
 }
 
-let makeTransport = (~postMessage, ~subscribe, ~maxChunkBytes) =>
-  makeDynamicTransport(~postMessage, ~maxChunkBytes, ~start=(~beginSession) => {
-    let session = beginSession()
-    session.opened()
-    subscribe(~onMessage=session.message, ~onDisconnect=session.disconnected)
-  })
+let makeTransport = (~postMessage, ~subscribe, ~maxChunkBytes) => {
+  let teardown = ref(None)
+  makeDynamicTransport(
+    ~postMessage,
+    ~maxChunkBytes,
+    ~start=(~prepareSession) => {
+      let session = prepareSession()
+      session.connecting()
+      session.opened()
+      teardown := Some(subscribe(~onMessage=session.message, ~onDisconnect=session.disconnected))
+    },
+    ~close=() => {
+      let current = teardown.contents
+      teardown := None
+      current->Option.forEach(dispose => dispose())
+    },
+  )
+}
 
 let rejectedPromise = message => Promise.make((_resolve, reject) => reject(JsError.make(message)))
 
@@ -652,9 +667,27 @@ let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
   }
 }
 
-let beginRuntimeSession = (runtime): session<'sender> => {
+let prepareRuntimeSession = (runtime): session<'sender> => {
   let sessionToken = ref(false)
+  runtime.latestPreparedSessionToken := Some(sessionToken)
   let session = {
+    connecting: () => {
+      if (
+        !sessionToken.contents && runtime.latestPreparedSessionToken.contents === Some(sessionToken)
+      ) {
+        sessionToken := true
+        switch runtime.currentStatus.contents {
+        | Closed(_) => ()
+        | Connecting | Open | Disconnected(_) => {
+            let previous = runtime.currentSessionToken.contents
+            runtime.currentSessionToken := Some(sessionToken)
+            runtime.currentStatus := Connecting
+            previous->Option.forEach(_ => clearCurrentWork(runtime, "Connection replaced"))
+            notifyStatus(runtime, Connecting)
+          }
+        }
+      }
+    },
     opened: () => {
       if (
         runtime.currentSessionToken.contents === Some(sessionToken) &&
@@ -681,16 +714,6 @@ let beginRuntimeSession = (runtime): session<'sender> => {
         notifyStatus(runtime, disconnected)
       }
     },
-  }
-  switch runtime.currentStatus.contents {
-  | Closed(_) => ()
-  | Connecting | Open | Disconnected(_) => {
-      let previous = runtime.currentSessionToken.contents
-      runtime.currentSessionToken := Some(sessionToken)
-      runtime.currentStatus := Connecting
-      previous->Option.forEach(_ => clearCurrentWork(runtime, "Connection replaced"))
-      notifyStatus(runtime, Connecting)
-    }
   }
   session
 }
@@ -728,12 +751,25 @@ let make:
       settledOrder: ref([]),
       settledIndex: ref(0),
       statusListeners: ref([]),
+      latestPreparedSessionToken: ref(None),
       currentSessionToken: ref(None),
       currentStatus: ref(Connecting),
       assemblyBytes: ref(0),
       teardown: ref(() => ()),
     }
-    runtime.teardown := transport.start(~beginSession=() => beginRuntimeSession(runtime))
+    runtime.teardown := transport.close
+    try {
+      transport.start(~prepareSession=() => prepareRuntimeSession(runtime))
+    } catch {
+    | error => {
+        try {
+          transport.close()
+        } catch {
+        | _ => ()
+        }
+        JsError.throw(Obj.magic(error))
+      }
+    }
     runtime
   }
 
@@ -871,6 +907,7 @@ let close = runtime => {
   | Connecting | Open | Disconnected(_) => {
       let reason = "Runtime closed"
       runtime.currentStatus := Closed(reason)
+      runtime.latestPreparedSessionToken := None
       runtime.currentSessionToken := None
       clearCurrentWork(runtime, reason)
       try {

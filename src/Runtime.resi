@@ -4,6 +4,7 @@
  */
 
 type session<'sender> = {
+  connecting: unit => unit,
   opened: unit => unit,
   message: (Obj.t, 'sender) => unit,
   disconnected: string => unit,
@@ -27,7 +28,8 @@ let makeTransport: (
 
 let makeDynamicTransport: (
   ~postMessage: Obj.t => result<unit, string>,
-  ~start: (~beginSession: unit => session<'sender>) => unit => unit,
+  ~start: (~prepareSession: unit => session<'sender>) => unit,
+  ~close: unit => unit,
   ~maxChunkBytes: int,
 ) => transport<'sender>
 
