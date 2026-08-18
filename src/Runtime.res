@@ -13,7 +13,7 @@ type transport<'sender> = {
   postMessage: Obj.t => result<unit, string>,
   start: (~beginSession: unit => session<'sender>) => unit => unit,
   maxChunkBytes: int,
-  mutable consumed: bool,
+  consumed: ref<bool>,
 }
 
 type limits = {
@@ -46,8 +46,8 @@ type assemblyKind = RequestAssembly | CastAssembly
 type assembly = {
   kind: assemblyKind,
   total: int,
-  mutable nextIndex: int,
-  mutable bytes: int,
+  nextIndex: ref<int>,
+  bytes: ref<int>,
   body: array<string>,
   deadlineMs: float,
   timeoutId: timeoutId,
@@ -66,11 +66,14 @@ type t<'sender> = {
   handler: registeredHandler<'sender>,
   pending: Map.t<Id.t, pendingRequest>,
   operations: Map.t<Id.t, operation>,
+  settled: Set.t<Id.t>,
+  settledOrder: ref<array<Id.t>>,
+  settledIndex: ref<int>,
   statusListeners: ref<array<status => unit>>,
-  mutable currentSessionToken: option<sessionToken>,
-  mutable currentStatus: status,
-  mutable assemblyBytes: int,
-  mutable teardown: unit => unit,
+  currentSessionToken: ref<option<sessionToken>>,
+  currentStatus: ref<status>,
+  assemblyBytes: ref<int>,
+  teardown: ref<unit => unit>,
 }
 
 @scope("Number") @val external isSafeInteger: Obj.t => bool = "isSafeInteger"
@@ -88,12 +91,19 @@ let exceptionMessage = error => {
   }
 }
 
-let makeTransport = (~postMessage, ~start, ~maxChunkBytes) => {
+let makeDynamicTransport = (~postMessage, ~start, ~maxChunkBytes) => {
   if !isSafeInteger(Obj.magic(maxChunkBytes)) || maxChunkBytes < 4 {
     JsError.throwWithMessage("Transport maxChunkBytes is invalid")
   }
-  {postMessage, start, maxChunkBytes, consumed: false}
+  {postMessage, start, maxChunkBytes, consumed: ref(false)}
 }
+
+let makeTransport = (~postMessage, ~subscribe, ~maxChunkBytes) =>
+  makeDynamicTransport(~postMessage, ~maxChunkBytes, ~start=(~beginSession) => {
+    let session = beginSession()
+    session.opened()
+    subscribe(~onMessage=session.message, ~onDisconnect=session.disconnected)
+  })
 
 let rejectedPromise = message => Promise.make((_resolve, reject) => reject(JsError.make(message)))
 
@@ -112,7 +122,7 @@ let removeFirst = (listeners, listener) => {
 
 let notifyStatus = (runtime, committedStatus) => {
   runtime.statusListeners.contents->Array.forEach(listener => {
-    if runtime.currentStatus === committedStatus {
+    if runtime.currentStatus.contents === committedStatus {
       try {
         listener(committedStatus)
       } catch {
@@ -123,14 +133,14 @@ let notifyStatus = (runtime, committedStatus) => {
 }
 
 let setStatus = (runtime, nextStatus) => {
-  runtime.currentStatus = nextStatus
+  runtime.currentStatus := nextStatus
   notifyStatus(runtime, nextStatus)
 }
 
-let status = runtime => runtime.currentStatus
+let status = runtime => runtime.currentStatus.contents
 
 let onStatus = (runtime, listener) => {
-  switch runtime.currentStatus {
+  switch runtime.currentStatus.contents {
   | Closed(_) => () => ()
   | Connecting | Open | Disconnected(_) => {
       runtime.statusListeners := runtime.statusListeners.contents->Array.concat([listener])
@@ -145,8 +155,24 @@ let onStatus = (runtime, listener) => {
   }
 }
 
+let markSettled = (runtime, id) => {
+  if !(runtime.settled->Set.has(id)) {
+    let capacity = runtime.limits.maxPendingRequests + 1
+    if runtime.settledOrder.contents->Array.length < capacity {
+      runtime.settledOrder.contents->Array.push(id)->ignore
+    } else {
+      runtime.settledOrder.contents
+      ->Array.get(runtime.settledIndex.contents)
+      ->Option.forEach(oldest => runtime.settled->Set.delete(oldest)->ignore)
+      runtime.settledOrder.contents[runtime.settledIndex.contents] = id
+      runtime.settledIndex := (runtime.settledIndex.contents + 1) % capacity
+    }
+    runtime.settled->Set.add(id)
+  }
+}
+
 let sendProtocol = (runtime, message) => {
-  switch runtime.currentStatus {
+  switch runtime.currentStatus.contents {
   | Closed(_) => JsError.throwWithMessage("Runtime is closed")
   | Connecting | Disconnected(_) => JsError.throwWithMessage("Runtime is not connected")
   | Open =>
@@ -190,7 +216,8 @@ let removeAssembly = (runtime, id, expected) => {
   | Some(Assembling(assembly)) if assembly === expected => {
       clearTimeout(assembly.timeoutId)
       runtime.operations->Map.delete(id)->ignore
-      runtime.assemblyBytes = runtime.assemblyBytes - assembly.bytes
+      runtime.assemblyBytes := runtime.assemblyBytes.contents - assembly.bytes.contents
+      markSettled(runtime, id)
       true
     }
   | Some(Assembling(_)) | Some(Executing(_)) | None => false
@@ -202,6 +229,7 @@ let removeExecution = (runtime, id, expected, ~abort) => {
   | Some(Executing(execution)) if execution === expected => {
       clearTimeout(execution.timeoutId)
       runtime.operations->Map.delete(id)->ignore
+      markSettled(runtime, id)
       if abort {
         execution.controller->AbortController.abort
       }
@@ -210,6 +238,30 @@ let removeExecution = (runtime, id, expected, ~abort) => {
   | Some(Assembling(_)) | Some(Executing(_)) | None => false
   }
 }
+
+let whenOpen = runtime =>
+  switch runtime.currentStatus.contents {
+  | Open => Promise.resolve()
+  | Closed(reason) => rejectedPromise(reason)
+  | Connecting | Disconnected(_) =>
+    Promise.make((resolve, reject) => {
+      let unsubscribe = ref(() => ())
+      unsubscribe :=
+        onStatus(runtime, status => {
+          switch status {
+          | Open => {
+              unsubscribe.contents()
+              resolve()
+            }
+          | Closed(reason) => {
+              unsubscribe.contents()
+              reject(JsError.make(reason))
+            }
+          | Connecting | Disconnected(_) => ()
+          }
+        })
+    })
+  }
 
 let clearCurrentWork = (runtime, reason) => {
   let pendingRequests = []
@@ -231,19 +283,20 @@ let clearCurrentWork = (runtime, reason) => {
     | Executing(execution) => removeExecution(runtime, id, execution, ~abort=true)->ignore
     }
   })
-  runtime.assemblyBytes = 0
+  runtime.assemblyBytes := 0
+  runtime.settled->Set.clear
+  runtime.settledOrder := []
+  runtime.settledIndex := 0
 }
 
 let sendResponse = (runtime, sessionToken, response) => {
-  if runtime.currentSessionToken === Some(sessionToken) {
+  if runtime.currentSessionToken.contents === Some(sessionToken) {
     let bounded: protocolMessage = switch response {
     | Success({id, value}) =>
       try {
-        let prepared = value->MessageChunker.prepareJson
-        if prepared.byteLength > runtime.limits.maxMessageBytes {
-          Failure({id, message: "Response exceeds maxMessageBytes"})
-        } else {
-          Success({id, value: prepared.value})
+        switch value->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
+        | Some(prepared) => Success({id, value: prepared.value})
+        | None => Failure({id, message: "Response exceeds maxMessageBytes"})
         }
       } catch {
       | _ => Failure({id, message: "Response could not be serialized"})
@@ -278,6 +331,7 @@ let finishExecution = (runtime, id, execution: execution) =>
 
 let runRequestHandler = (runtime, sessionToken, id, message, sender, ~deadlineMs=?) => {
   if runtime.operations->Map.size >= runtime.limits.maxPendingRequests {
+    markSettled(runtime, id)
     sendResponse(runtime, sessionToken, Failure({id, message: "Too many pending requests"}))
   } else {
     let controller = AbortController.make()
@@ -353,7 +407,8 @@ let failAssembly = (runtime, sessionToken, id, kind, message, ~respond) => {
   switch runtime.operations->Map.get(id) {
   | Some(Assembling(assembly)) if assembly.kind === kind =>
     removeAssembly(runtime, id, assembly)->ignore
-  | Some(Assembling(_)) | Some(Executing(_)) | None => ()
+  | None => markSettled(runtime, id)
+  | Some(Assembling(_)) | Some(Executing(_)) => ()
   }
   if respond {
     sendResponse(runtime, sessionToken, Failure({id, message}))
@@ -364,7 +419,9 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
   let respond = kind === RequestAssembly
   let malformed = () =>
     failAssembly(runtime, sessionToken, id, kind, "Malformed chunk sequence", ~respond)
-  if (
+  if runtime.settled->Set.has(id) {
+    ()
+  } else if (
     !isSafeInteger(Obj.magic(index)) ||
     !isSafeInteger(Obj.magic(total)) ||
     index < 0 ||
@@ -398,8 +455,8 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
           let assembly = {
             kind,
             total,
-            nextIndex: 0,
-            bytes: 0,
+            nextIndex: ref(0),
+            bytes: ref(0),
             body: [],
             deadlineMs,
             timeoutId,
@@ -410,6 +467,7 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
         }
       | Some(Assembling(assembly)) => Some(assembly)
       | None => {
+          markSettled(runtime, id)
           if respond {
             sendResponse(runtime, sessionToken, Failure({id, message: "Too many pending requests"}))
           }
@@ -426,10 +484,10 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
       | Some(assembly)
         if assembly.kind !== kind ||
         assembly.total !== total ||
-        assembly.nextIndex !== index ||
-        assembly.bytes + bodyBytes > runtime.limits.maxMessageBytes =>
+        assembly.nextIndex.contents !== index ||
+        assembly.bytes.contents + bodyBytes > runtime.limits.maxMessageBytes =>
         malformed()
-      | Some(_) if runtime.assemblyBytes + bodyBytes > runtime.limits.maxMessageBytes =>
+      | Some(_) if runtime.assemblyBytes.contents + bodyBytes > runtime.limits.maxMessageBytes =>
         failAssembly(
           runtime,
           sessionToken,
@@ -440,10 +498,10 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
         )
       | Some(assembly) => {
           assembly.body->Array.push(body)->ignore
-          assembly.bytes = assembly.bytes + bodyBytes
-          runtime.assemblyBytes = runtime.assemblyBytes + bodyBytes
-          assembly.nextIndex = assembly.nextIndex + 1
-          if assembly.nextIndex === total {
+          assembly.bytes := assembly.bytes.contents + bodyBytes
+          runtime.assemblyBytes := runtime.assemblyBytes.contents + bodyBytes
+          assembly.nextIndex := assembly.nextIndex.contents + 1
+          if assembly.nextIndex.contents === total {
             removeAssembly(runtime, id, assembly)->ignore
             try {
               let message = assembly.body->Array.join("")->JSON.parseOrThrow->Obj.magic
@@ -477,7 +535,10 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
   }
 }
 
-let isValidId = id => Type.typeof(Obj.magic(id)) === #string && id->Id.toString !== ""
+let isValidId = id =>
+  Type.typeof(Obj.magic(id)) === #string &&
+  id->Id.toString !== "" &&
+  id->Id.toString->String.length <= 64
 let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
   try {
     switch (Obj.magic(rawMessage): protocolMessage) {
@@ -487,14 +548,15 @@ let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
           rejectPending(runtime, id, "Invalid response payload")
         } else {
           try {
-            let prepared = value->MessageChunker.prepareJson
-            if prepared.byteLength > runtime.limits.maxMessageBytes {
-              rejectPending(runtime, id, "Invalid response payload")
-            } else {
+            switch value->MessageChunker.prepareJsonWithin(
+              ~maxBytes=runtime.limits.maxMessageBytes,
+            ) {
+            | Some(prepared) =>
               switch takePending(runtime, id) {
               | Some(pending) => pending.resolve(prepared.value)
               | None => ()
               }
+            | None => rejectPending(runtime, id, "Invalid response payload")
             }
           } catch {
           | _ => rejectPending(runtime, id, "Invalid response payload")
@@ -515,20 +577,21 @@ let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
       }
     | Request({id, message}) =>
       if hasOwn(rawMessage, "id") && isValidId(id) && hasOwn(rawMessage, "message") {
-        switch runtime.operations->Map.get(id) {
-        | Some(_) =>
-          sendResponse(runtime, sessionToken, Failure({id, message: "Duplicate request"}))
-        | None =>
+        switch (runtime.operations->Map.get(id), runtime.settled->Set.has(id)) {
+        | (Some(_), _) => ()
+        | (None, true) => ()
+        | (None, false) =>
           try {
-            let prepared = message->MessageChunker.prepareJson
-            if prepared.byteLength > runtime.limits.maxMessageBytes {
+            switch message->MessageChunker.prepareJsonWithin(
+              ~maxBytes=runtime.limits.maxMessageBytes,
+            ) {
+            | None =>
               sendResponse(
                 runtime,
                 sessionToken,
                 Failure({id, message: "Message exceeds maxMessageBytes"}),
               )
-            } else {
-              runRequestHandler(runtime, sessionToken, id, prepared.value, sender)
+            | Some(prepared) => runRequestHandler(runtime, sessionToken, id, prepared.value, sender)
             }
           } catch {
           | _ =>
@@ -552,9 +615,11 @@ let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
     | Cast(message) =>
       if hasOwn(rawMessage, "_0") {
         try {
-          let prepared = message->MessageChunker.prepareJson
-          if prepared.byteLength <= runtime.limits.maxMessageBytes {
-            runCastHandler(runtime, prepared.value, sender)
+          switch message->MessageChunker.prepareJsonWithin(
+            ~maxBytes=runtime.limits.maxMessageBytes,
+          ) {
+          | Some(prepared) => runCastHandler(runtime, prepared.value, sender)
+          | None => ()
           }
         } catch {
         | _ => ()
@@ -591,32 +656,38 @@ let beginRuntimeSession = (runtime): session<'sender> => {
   let sessionToken = ref(false)
   let session = {
     opened: () => {
-      if runtime.currentSessionToken === Some(sessionToken) && runtime.currentStatus !== Open {
-        runtime.currentStatus = Open
+      if (
+        runtime.currentSessionToken.contents === Some(sessionToken) &&
+          runtime.currentStatus.contents !== Open
+      ) {
+        runtime.currentStatus := Open
         notifyStatus(runtime, Open)
       }
     },
     message: (payload, sender) => {
-      if runtime.currentStatus === Open && runtime.currentSessionToken === Some(sessionToken) {
+      if (
+        runtime.currentStatus.contents === Open &&
+          runtime.currentSessionToken.contents === Some(sessionToken)
+      ) {
         handleMessage(runtime, sessionToken, payload, sender)
       }
     },
     disconnected: reason => {
-      if runtime.currentSessionToken === Some(sessionToken) {
-        runtime.currentSessionToken = None
+      if runtime.currentSessionToken.contents === Some(sessionToken) {
+        runtime.currentSessionToken := None
         let disconnected: status = Disconnected(reason)
-        runtime.currentStatus = disconnected
+        runtime.currentStatus := disconnected
         clearCurrentWork(runtime, reason)
         notifyStatus(runtime, disconnected)
       }
     },
   }
-  switch runtime.currentStatus {
+  switch runtime.currentStatus.contents {
   | Closed(_) => ()
   | Connecting | Open | Disconnected(_) => {
-      let previous = runtime.currentSessionToken
-      runtime.currentSessionToken = Some(sessionToken)
-      runtime.currentStatus = Connecting
+      let previous = runtime.currentSessionToken.contents
+      runtime.currentSessionToken := Some(sessionToken)
+      runtime.currentStatus := Connecting
       previous->Option.forEach(_ => clearCurrentWork(runtime, "Connection replaced"))
       notifyStatus(runtime, Connecting)
     }
@@ -631,7 +702,7 @@ let make:
     ~handler: (Types.message<response>, sender, context) => Response.t<response>,
   ) => t<sender> =
   (transport, ~limits, ~handler) => {
-    if transport.consumed {
+    if transport.consumed.contents {
       JsError.throwWithMessage("Transport has already been consumed")
     }
     if (
@@ -646,25 +717,28 @@ let make:
     ) {
       JsError.throwWithMessage("Runtime limits are invalid")
     }
-    transport.consumed = true
+    transport.consumed := true
     let runtime = {
       transport,
       limits,
       handler: Obj.magic(handler),
       pending: Map.make(),
       operations: Map.make(),
+      settled: Set.make(),
+      settledOrder: ref([]),
+      settledIndex: ref(0),
       statusListeners: ref([]),
-      currentSessionToken: None,
-      currentStatus: Connecting,
-      assemblyBytes: 0,
-      teardown: () => (),
+      currentSessionToken: ref(None),
+      currentStatus: ref(Connecting),
+      assemblyBytes: ref(0),
+      teardown: ref(() => ()),
     }
-    runtime.teardown = transport.start(~beginSession=() => beginRuntimeSession(runtime))
+    runtime.teardown := transport.start(~beginSession=() => beginRuntimeSession(runtime))
     runtime
   }
 
 let sendPreparedRequest = (runtime, prepared: MessageChunker.preparedJson, ~signal=?) => {
-  switch runtime.currentSessionToken {
+  switch runtime.currentSessionToken.contents {
   | None => rejectedPromise("Runtime is not connected")
   | Some(_) if runtime.pending->Map.size >= runtime.limits.maxPendingRequests =>
     rejectedPromise("Too many pending requests")
@@ -694,17 +768,8 @@ let sendPreparedRequest = (runtime, prepared: MessageChunker.preparedJson, ~sign
           )
           let sentChunks = ref(0)
           try {
-            if prepared.byteLength > runtime.transport.maxChunkBytes {
-              let minimumChunkBytes = runtime.transport.maxChunkBytes - 3
-              let chunkCount = (prepared.byteLength - 1) / minimumChunkBytes + 1
-              if chunkCount > MessageChunker.maxChunksPerMessage {
-                JsError.throwWithMessage("Too many chunks")
-              }
-              let chunks =
-                prepared.encoded
-                ->Option.getOrThrow
-                ->MessageChunker.splitEncodedIntoChunks(~size=runtime.transport.maxChunkBytes)
-                ->Array.map(MessageChunker.decodeBinary)
+            switch prepared->MessageChunker.chunkPrepared(~size=runtime.transport.maxChunkBytes) {
+            | Some(chunks) =>
               let index = ref(0)
               while index.contents < chunks->Array.length && runtime.pending->Map.has(id) {
                 sendProtocol(
@@ -719,7 +784,7 @@ let sendPreparedRequest = (runtime, prepared: MessageChunker.preparedJson, ~sign
                 sentChunks := sentChunks.contents + 1
                 index := index.contents + 1
               }
-            } else {
+            | None =>
               sendProtocol(runtime, (Request({id, message: prepared.value}): protocolMessage))
             }
           } catch {
@@ -749,11 +814,9 @@ let sendMessage:
   ) => Promise.t<response> =
   (runtime, message, ~signal=?) => {
     try {
-      let prepared = message->MessageChunker.prepareJson
-      if prepared.byteLength > runtime.limits.maxMessageBytes {
-        rejectedPromise("Message exceeds maxMessageBytes")
-      } else {
-        sendPreparedRequest(runtime, prepared, ~signal?)->Obj.magic
+      switch message->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
+      | Some(prepared) => sendPreparedRequest(runtime, prepared, ~signal?)->Obj.magic
+      | None => rejectedPromise("Message exceeds maxMessageBytes")
       }
     } catch {
     | error => Promise.reject(error)
@@ -763,22 +826,15 @@ let sendMessage:
 let cast:
   type sender. (t<sender>, Types.message<unit>) => unit =
   (runtime, message) => {
-    let prepared = message->MessageChunker.prepareJson
-    if prepared.byteLength > runtime.limits.maxMessageBytes {
-      JsError.throwWithMessage("Message exceeds maxMessageBytes")
+    let prepared = switch message->MessageChunker.prepareJsonWithin(
+      ~maxBytes=runtime.limits.maxMessageBytes,
+    ) {
+    | Some(prepared) => prepared
+    | None => JsError.throwWithMessage("Message exceeds maxMessageBytes")
     }
-    if prepared.byteLength > runtime.transport.maxChunkBytes {
+    switch prepared->MessageChunker.chunkPrepared(~size=runtime.transport.maxChunkBytes) {
+    | Some(chunks) =>
       let id = Id.make()
-      let minimumChunkBytes = runtime.transport.maxChunkBytes - 3
-      let chunkCount = (prepared.byteLength - 1) / minimumChunkBytes + 1
-      if chunkCount > MessageChunker.maxChunksPerMessage {
-        JsError.throwWithMessage("Too many chunks")
-      }
-      let chunks =
-        prepared.encoded
-        ->Option.getOrThrow
-        ->MessageChunker.splitEncodedIntoChunks(~size=runtime.transport.maxChunkBytes)
-        ->Array.map(MessageChunker.decodeBinary)
       let sent = ref(0)
       try {
         chunks->Array.forEachWithIndex((body, index) => {
@@ -805,21 +861,20 @@ let cast:
           JsError.throwWithMessage(exceptionMessage(error))
         }
       }
-    } else {
-      sendProtocol(runtime, (Cast(prepared.value): protocolMessage))
+    | None => sendProtocol(runtime, (Cast(prepared.value): protocolMessage))
     }
   }
 
 let close = runtime => {
-  switch runtime.currentStatus {
+  switch runtime.currentStatus.contents {
   | Closed(_) => ()
   | Connecting | Open | Disconnected(_) => {
       let reason = "Runtime closed"
-      runtime.currentStatus = Closed(reason)
-      runtime.currentSessionToken = None
+      runtime.currentStatus := Closed(reason)
+      runtime.currentSessionToken := None
       clearCurrentWork(runtime, reason)
       try {
-        runtime.teardown()
+        runtime.teardown.contents()
       } catch {
       | error => Console.error2("Transport teardown failed:", error)
       }

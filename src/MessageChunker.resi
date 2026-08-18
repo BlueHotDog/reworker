@@ -9,10 +9,7 @@ type preparedJson = {
   byteLength: int,
 }
 
-let defaultChunkSize: int
 let maxChunksPerMessage: int
-let prepareJson: 'a => preparedJson
+let prepareJsonWithin: ('a, ~maxBytes: int) => option<preparedJson>
 let stringByteLength: string => int
-let splitEncodedIntoChunks: (Uint8Array.t, ~size: int) => array<Uint8Array.t>
-let splitIntoChunks: (string, ~size: int=?, unit) => array<Uint8Array.t>
-let decodeBinary: Uint8Array.t => string
+let chunkPrepared: (preparedJson, ~size: int) => option<array<string>>

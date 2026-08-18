@@ -244,6 +244,7 @@ module Parent = {
                 let connectionId = Id.make()->Id.toString
                 let channel = MessageChannel.make()
                 let port = MessageChannel.port1(channel)
+                let remotePort = MessageChannel.port2(channel)
                 let session = beginSession()
                 let onMessage = event => {
                   switch state.contents {
@@ -333,10 +334,11 @@ module Parent = {
                           Obj.magic(config.targetWindow),
                           bootstrap,
                           config.targetOrigin,
-                          [MessageChannel.port2(channel)],
+                          [remotePort],
                         )
                       } catch {
                       | error =>
+                        closePortSafely(remotePort)
                         disconnectSession(session, exceptionMessage(error), ~notifyRemote=false)
                       }
                     | Idle | Connecting(_) | Open(_) | Closed => connection.cleanup()
@@ -344,7 +346,7 @@ module Parent = {
                   }
                 | Connecting(_) | Open(_) | Closed => {
                     connection.cleanup()
-                    closePortSafely(MessageChannel.port2(channel))
+                    closePortSafely(remotePort)
                     session.disconnected("Window connection setup was abandoned")
                   }
                 }
@@ -376,7 +378,12 @@ module Parent = {
           let current = commitClosed()
           // No disposer exists on this path. subscribeLoad must undo registration before throwing.
           current->Option.forEach(connection => {
-            connection.cleanup()
+            closeConnection(
+              connection,
+              ~channel=config.channel,
+              ~reason=exceptionMessage(error),
+              ~notifyRemote=true,
+            )
             connection.session.disconnected(exceptionMessage(error))
           })
           JsError.throw(Obj.magic(error))
@@ -426,7 +433,7 @@ module Parent = {
       }
     }
 
-    Runtime.makeTransport(~postMessage, ~start, ~maxChunkBytes=config.maxChunkBytes)
+    Runtime.makeDynamicTransport(~postMessage, ~start, ~maxChunkBytes=config.maxChunkBytes)
   }
 }
 
@@ -627,6 +634,6 @@ module Child = {
       }
     }
 
-    Runtime.makeTransport(~postMessage, ~start, ~maxChunkBytes=config.maxChunkBytes)
+    Runtime.makeDynamicTransport(~postMessage, ~start, ~maxChunkBytes=config.maxChunkBytes)
   }
 }

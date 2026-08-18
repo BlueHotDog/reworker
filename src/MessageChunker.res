@@ -3,7 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-let defaultChunkSize = 31 * 1000 * 1000
 let maxChunksPerMessage = 10_000
 
 type preparedJson = {
@@ -83,18 +82,23 @@ let rec validateJsonValue = (value, seen, ~root) => {
 
 let stringByteLength = value => makeTextEncoder()->encode(value)->TypedArray.byteLength
 
-let prepareJson = value => {
+let prepareJsonWithin = (value, ~maxBytes) => {
   validateJsonValue(Obj.magic(value), makeSeenObjects(), ~root=true)
   switch value->JSON.stringifyAny {
   | Some(json) => {
       let encoded = makeTextEncoder()->encode(json)
-      {
-        value: json->JSON.parseOrThrow->Obj.magic,
-        encoded: Some(encoded),
-        byteLength: encoded->TypedArray.byteLength,
+      let byteLength = encoded->TypedArray.byteLength
+      if byteLength > maxBytes {
+        None
+      } else {
+        Some({
+          value: json->JSON.parseOrThrow->Obj.magic,
+          encoded: Some(encoded),
+          byteLength,
+        })
       }
     }
-  | None => {value: Obj.magic(value), encoded: None, byteLength: 0}
+  | None => Some({value: Obj.magic(value), encoded: None, byteLength: 0})
   }
 }
 
@@ -139,7 +143,21 @@ let splitEncodedIntoChunks = (encoded, ~size) => {
   chunks
 }
 
-let splitIntoChunks = (string, ~size=defaultChunkSize, ()) =>
-  makeTextEncoder()->encode(string)->splitEncodedIntoChunks(~size)
-
 let decodeBinary = binary => makeTextDecoder()->decode(binary)
+
+let chunkPrepared = (prepared, ~size) => {
+  if prepared.byteLength <= size {
+    None
+  } else {
+    let minimumChunkBytes = size - 3
+    let chunkCount = (prepared.byteLength - 1) / minimumChunkBytes + 1
+    if chunkCount > maxChunksPerMessage {
+      JsError.throwWithMessage("Too many chunks")
+    }
+    prepared.encoded
+    ->Option.getOrThrow
+    ->splitEncodedIntoChunks(~size)
+    ->Array.map(decodeBinary)
+    ->Some
+  }
+}

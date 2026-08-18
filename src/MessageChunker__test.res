@@ -12,29 +12,36 @@ let createLargeString = size => {
 }
 
 let testPreparedJson = () => {
-  let prepared = MessageChunker.prepareJson({"message": "hello"})
-  prepared.encoded->Option.isSome && prepared.byteLength === 19
+  let prepared =
+    MessageChunker.prepareJsonWithin({"message": "hello"}, ~maxBytes=19)->Option.getOrThrow
+  let withinLimit = MessageChunker.prepareJsonWithin({"message": "hello"}, ~maxBytes=19)
+  let overLimit = MessageChunker.prepareJsonWithin({"message": "hello"}, ~maxBytes=18)
+  prepared.encoded->Option.isSome &&
+  prepared.byteLength === 19 &&
+  withinLimit->Option.isSome &&
+  overLimit->Option.isNone
 }
 
 // Test: Chunk splitting and reassembly
 let testChunkSplitAndReassemble = () => {
-  let originalMessage = createLargeString(MessageChunker.defaultChunkSize * 2 + 500)
+  let chunkSize = 1000
+  let originalMessage = createLargeString(chunkSize * 2 + 500)
 
   try {
-    // Split into chunks
     let chunks =
-      originalMessage->MessageChunker.splitIntoChunks(~size=MessageChunker.defaultChunkSize, ())
+      originalMessage
+      ->MessageChunker.prepareJsonWithin(~maxBytes=10_000)
+      ->Option.getOrThrow
+      ->MessageChunker.chunkPrepared(~size=chunkSize)
+      ->Option.getOrThrow
 
     // Verify we got multiple chunks
     if chunks->Array.length < 2 {
       Console.error("FAIL: Large message didn't split into multiple chunks")
       false
     } else {
-      // Decode chunks back to strings
-      let decodedChunks = chunks->Array.map(MessageChunker.decodeBinary)
-
       // Reassemble
-      let reassembled = decodedChunks->Array.join("")
+      let reassembled: string = chunks->Array.join("")->JSON.parseOrThrow->Obj.magic
 
       if reassembled === originalMessage {
         Console.log(
@@ -63,9 +70,13 @@ let testUnicodeHandling = () => {
   let repeated = Array.fromInitializer(~length=1000, _ => unicodeMessage)->Array.join(" ")
 
   try {
-    let chunks = repeated->MessageChunker.splitIntoChunks(~size=1000, ())
-    let decodedChunks = chunks->Array.map(MessageChunker.decodeBinary)
-    let reassembled = decodedChunks->Array.join("")
+    let chunks =
+      repeated
+      ->MessageChunker.prepareJsonWithin(~maxBytes=100_000)
+      ->Option.getOrThrow
+      ->MessageChunker.chunkPrepared(~size=1000)
+      ->Option.getOrThrow
+    let reassembled: string = chunks->Array.join("")->JSON.parseOrThrow->Obj.magic
 
     if reassembled === repeated {
       Console.log("PASS: Unicode characters handled correctly in chunking")

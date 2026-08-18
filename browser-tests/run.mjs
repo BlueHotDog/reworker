@@ -36,10 +36,16 @@ const childHtml = `<!doctype html><script type="module" src="/child.js"></script
 const parentHtml = `<!doctype html>
 <script>
 window.portListenerRemoves = 0
+window.portMessagePosts = 0
 const removePortListener = MessagePort.prototype.removeEventListener
+const postPortMessage = MessagePort.prototype.postMessage
 MessagePort.prototype.removeEventListener = function(...args) {
 	window.portListenerRemoves += 1
 	return removePortListener.apply(this, args)
+}
+MessagePort.prototype.postMessage = function(...args) {
+	window.portMessagePosts += 1
+	return postPortMessage.apply(this, args)
 }
 </script>
 <iframe id="child-a" src="http://${host}:${childPort}/child"></iframe>

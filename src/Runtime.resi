@@ -21,6 +21,12 @@ type t<'sender>
 
 let makeTransport: (
   ~postMessage: Obj.t => result<unit, string>,
+  ~subscribe: (~onMessage: (Obj.t, 'sender) => unit, ~onDisconnect: string => unit) => unit => unit,
+  ~maxChunkBytes: int,
+) => transport<'sender>
+
+let makeDynamicTransport: (
+  ~postMessage: Obj.t => result<unit, string>,
   ~start: (~beginSession: unit => session<'sender>) => unit => unit,
   ~maxChunkBytes: int,
 ) => transport<'sender>
@@ -38,4 +44,5 @@ let sendMessage: (
 let cast: (t<'sender>, Types.message<unit>) => unit
 let status: t<'sender> => status
 let onStatus: (t<'sender>, status => unit) => unit => unit
+let whenOpen: t<'sender> => Promise.t<unit>
 let close: t<'sender> => unit

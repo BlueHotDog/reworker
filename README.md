@@ -23,7 +23,19 @@ type Types.message<_> +=
   | RunExpensiveTask(string): Types.message<string>
 ```
 
-Define runtime limits and one application handler:
+Adapt your connection once. `Runtime.makeTransport` covers connections that open
+immediately and do not reconnect themselves:
+
+```rescript
+let transport = Runtime.makeTransport(
+  ~maxChunkBytes=1_000_000,
+  ~postMessage=RawConnection.postMessage,
+  ~subscribe=(~onMessage, ~onDisconnect) =>
+    RawConnection.subscribe(~onMessage, ~onDisconnect),
+)
+```
+
+Define limits and one application handler:
 
 ```rescript
 let limits: Runtime.limits = {
@@ -59,13 +71,21 @@ Request handlers receive `Runtime.Request(signal)`. Cast handlers receive
 `AbortSignal.onAbort(signal, callback)` returns an idempotent unsubscribe
 function. Long-running request handlers should stop work after abort.
 
-Create one runtime from one transport. Limits and handler are mandatory:
+Create the runtime, then expose small domain functions. Callers do not need to
+know about runtime or transport details:
 
 ```rescript
 let runtime = Runtime.make(transport, ~limits, ~handler)
 
-let user = await Runtime.sendMessage(runtime, GetUser("123"))
-Runtime.cast(runtime, SaveData("saved without a response"))
+let getUser = userId => Runtime.sendMessage(runtime, GetUser(userId))
+let saveData = data => Runtime.cast(runtime, SaveData(data))
+```
+
+Call these functions from application code:
+
+```rescript
+let user = await Background.getUser("123")
+Background.saveData("saved without a response")
 ```
 
 Cancel an outgoing request with `AbortController`:
@@ -89,6 +109,14 @@ settle the request once.
 
 Read current status with `Runtime.status`. Subscribe to later transitions with
 `Runtime.onStatus`; it returns an idempotent unsubscribe function.
+
+Use `Runtime.whenOpen` when startup is asynchronous. It resolves immediately for
+an open runtime, waits across connection attempts, and rejects if runtime closes:
+
+```rescript
+await Runtime.whenOpen(runtime)
+let user = await Runtime.sendMessage(runtime, GetUser("123"))
+```
 
 ```rescript
 let _initialStatus = Runtime.status(runtime)
@@ -203,8 +231,8 @@ let childRuntime = Runtime.make(childTransport, ~limits, ~handler)
 
 `Runtime.make` starts both endpoints automatically. Parent begins connection
 bootstrap and child begins listening for matching bootstrap; there is no
-`WindowTransport.Parent.connect` or `WindowTransport.Child.listen`. Wait for
-`Runtime.Open` before sending. Parent reconnects after subscribed iframe load,
+`WindowTransport.Parent.connect` or `WindowTransport.Child.listen`. Await
+`Runtime.whenOpen` before sending. Parent reconnects after subscribed iframe load,
 using `connectionTimeoutMs` to bound readiness wait. Wildcard or empty origins
 are rejected.
 
@@ -215,59 +243,38 @@ and closes active port. If registration throws before returning teardown,
 
 ## Custom Transports
 
-Use `Runtime.makeTransport` to adapt an ordered duplex connection. `start`
-receives `beginSession` capability and returns teardown; no transport record
-fields are public.
+Use `Runtime.makeTransport` for a single ordered duplex connection:
 
 ```rescript
 let transport = Runtime.makeTransport(
   ~maxChunkBytes=1_000_000,
-  ~postMessage=payload => RawConnection.postMessage(payload),
-  ~start=(~beginSession) => {
-    let stopped = ref(false)
-    let removeSessions = ref([])
-    let removeConnection = RawConnection.onConnection(connection => {
-      if !stopped.contents {
-        let session = beginSession()
-        // beginSession publishes Connecting and can synchronously trigger close.
-        if !stopped.contents {
-          let removeSession = RawConnection.subscribe(
-            connection,
-            ~onOpen=() => session.opened(),
-            ~onMessage=(payload, sender) => session.message(payload, sender),
-            ~onDisconnect=reason => session.disconnected(reason),
-          )
-          removeSessions := removeSessions.contents->Array.concat([removeSession])
-        }
-      }
-    })
-
-    () => {
-      stopped := true
-      removeConnection()
-      removeSessions.contents->Array.forEach(remove => remove())
-      RawConnection.close()
-    }
-  },
+  ~postMessage=RawConnection.postMessage,
+  ~subscribe=(~onMessage, ~onDisconnect) =>
+    RawConnection.subscribe(~onMessage, ~onDisconnect),
 )
 
 let runtime = Runtime.make(transport, ~limits, ~handler)
 ```
 
 `postMessage` returns `Ok()` or `Error(message)`, including structured-clone
-failure. Each physical connection calls `beginSession()` once, then uses returned
-`session.opened()`, `session.message(payload, sender)`, and
-`session.disconnected(reason)` capabilities. Starting new session immediately
-makes older session sinks stale; late callbacks on them cannot affect runtime.
-Transport does not create or expose runtime session identity.
+failure. `subscribe` installs message and disconnect callbacks and returns
+teardown. Runtime opens this transport immediately and calls teardown once when
+closed. If `subscribe` throws after acquiring resources, it must release them
+before throwing because no teardown was returned.
 
-`beginSession()` publishes `Runtime.Connecting` synchronously. Status listeners
-can close runtime during that call, so transports must recheck their stopped
-state before installing connection listeners or resources.
+### Dynamic Transports
 
-Teardown removes listeners and releases connection resources. Runtime calls it
-once during terminal close. If `start` throws, it must first release resources
-acquired before failure because no teardown was returned.
+Only transport implementations that manage physical reconnects need
+`Runtime.makeDynamicTransport`. Its `start` callback receives `beginSession`.
+Call `beginSession()` once per physical connection, then report lifecycle through
+returned `opened`, `message`, and `disconnected` functions. A new session makes
+older callbacks inert.
+
+`beginSession()` publishes `Runtime.Connecting` synchronously. Recheck transport
+state before installing resources because status listeners can close runtime
+during this callback. `start` must return one teardown that releases current
+connection and listener resources without retaining old session disposers. If
+`start` throws after acquiring resources, it must release them before throwing.
 
 Custom transport must preserve callback and chunk order. Runtime does not sort
 chunks or acknowledge individual chunks.
@@ -276,15 +283,19 @@ chunks or acknowledge individual chunks.
 
 - Replace `module Runtime = Runtime.Make(Bindings)` with transport value and
   `Runtime.make(transport, ~limits, ~handler)`.
-- Replace transport records with `Runtime.makeTransport`; startup receives
-  `beginSession`, which returns session sink for each physical connection.
+- Replace simple transport records with `Runtime.makeTransport` and a `subscribe`
+  callback. Use `Runtime.makeDynamicTransport` only for transport-managed reconnects.
 - Move request limits to `Runtime.make`; keep `maxChunkBytes` in transport.
 - Update handlers to receive `Runtime.Request(signal) | Runtime.Cast` context.
 - Replace handler listener registration with mandatory `~handler` argument.
 - Replace lifecycle callbacks with `Runtime.status` and `Runtime.onStatus`.
+- Replace readiness promises with `Runtime.whenOpen(runtime)`.
 - Replace window functors with `WindowTransport.Parent.make` or
   `WindowTransport.Child.make`, including matching `channel` values.
 - Remove explicit `connect` and `listen`; startup occurs in `Runtime.make`.
+- Change cast-only constructors to `Types.message<unit>`; use `sendMessage` when a
+  response is required.
+- Replace `isContextValid()` with `Runtime.status(runtime) === Runtime.Open`.
 - Call `Runtime.close(runtime)` for terminal teardown. Do not reuse transport.
 
 ## Features

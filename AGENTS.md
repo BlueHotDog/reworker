@@ -7,11 +7,10 @@ chunked message passing in workers and Manifest V3 browser extensions.
 
 - `src/Types.res` defines the extensible `Types.message<_>` GADT. Each message
   constructor determines its response type.
-- `src/Runtime.res` is a functor over environment-specific bindings. It provides
-  promise-based sending, fire-and-forget casts, listener management, and context
-  validity checks.
-- `src/TransportMessage.res`, `src/MessageChunker.res`, and
-  `src/RequestHandler.res` implement transparent chunking and reassembly.
+- `src/Runtime.res` owns protocol framing, lifecycle state, request handling,
+  cancellation, and transparent chunk reassembly.
+- `src/MessageChunker.res` validates and prepares JSON payloads once, then
+  splits their encoded bytes at safe UTF-8 boundaries when needed.
 - `src/Response.res` represents immediate, deferred, and absent responses.
 - `src/Channel.res` and `src/ChannelTypes.res` provide persistent port channels
   for background and tab connections.

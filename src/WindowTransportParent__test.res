@@ -18,6 +18,7 @@ type event
 @new external makeEvent: string => event = "Event"
 @val external globalObject: Dict.t<Obj.t> = "globalThis"
 @val external portListenerRemoves: int = "portListenerRemoves"
+@val external portMessagePosts: int = "portMessagePosts"
 
 open WindowTransportBrowserMessages__test
 
@@ -77,6 +78,7 @@ let makeRuntime = (iframe, channel, ~timeout=500) =>
 
 let testSubscribeFailureCleansCallbackConnection = iframe => {
   let removalsBefore = portListenerRemoves
+  let postsBefore = portMessagePosts
   let rolledBackSubscription = ref(false)
   let didThrow = ref(false)
   try {
@@ -103,7 +105,8 @@ let testSubscribeFailureCleansCallbackConnection = iframe => {
   if (
     !didThrow.contents ||
     !rolledBackSubscription.contents ||
-    portListenerRemoves - removalsBefore !== 2
+    portListenerRemoves - removalsBefore !== 2 ||
+    portMessagePosts - postsBefore !== 1
   ) {
     JsError.throwWithMessage("subscribe failure did not roll back parent startup")
   }
