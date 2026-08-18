@@ -13,6 +13,8 @@ type Types.message<_> +=
   | Ignored: Types.message<string>
   | ThrowUnstringifiable: Types.message<string>
 
+@scope("Object") @val external defineProperty: (Obj.t, string, Obj.t) => Obj.t = "defineProperty"
+
 type endpoint = {
   prepareSession: ref<option<unit => Runtime.session<unit>>>,
   session: ref<option<Runtime.session<unit>>>,
@@ -612,6 +614,41 @@ let testLateResponseAfterAbortStaysRejected = async () => {
   Runtime.close(left)
   Runtime.close(right)
   rejected && cancelledOnce && aborted.contents === 1
+}
+
+let testLateRejectionAfterAbortIsIgnored = async () => {
+  let pair = makePair()
+  let rejectResponse = ref(None)
+  let delayedHandler:
+    type response. (Types.message<response>, unit, Runtime.context) => Response.t<response> =
+    (message, _sender, _context) =>
+      switch message {
+      | Cancellable =>
+        Response.later(Promise.make((_resolve, reject) => rejectResponse := Some(reject)))
+      | _ => Response.none
+      }
+  let left = Runtime.make(pair.left, ~limits=limits(), ~handler)
+  let right = Runtime.make(pair.right, ~limits=limits(), ~handler=delayedHandler)
+  let controller = AbortController.make()
+  let pending = Runtime.sendMessage(left, Cancellable, ~signal=controller->AbortController.signal)
+  controller->AbortController.abort
+  let conversions = ref(0)
+  let lateError = Dict.make()
+  let descriptor = Dict.make()
+  descriptor->Dict.set(
+    "get",
+    Obj.magic(() => {
+      conversions := conversions.contents + 1
+      "late error"
+    }),
+  )
+  defineProperty(Obj.magic(lateError), "message", Obj.magic(descriptor))->ignore
+  rejectResponse.contents->Option.forEach(reject => reject(Obj.magic(lateError)))
+  let rejected = await rejectsWith(pending, "aborted")
+  await wait(0)
+  Runtime.close(left)
+  Runtime.close(right)
+  rejected && conversions.contents === 0
 }
 
 let testAbortAfterTimeoutDoesNotCancelTwice = async () => {
@@ -1232,6 +1269,7 @@ let runTests = async () => {
     ("whenOpen rejects after close", testWhenOpenRejectsAfterClose),
     ("abort after response does not cancel", testAbortAfterResponseDoesNotCancel),
     ("late response after abort stays rejected", testLateResponseAfterAbortStaysRejected),
+    ("late rejection after abort is ignored", testLateRejectionAfterAbortIsIgnored),
     ("abort after timeout does not cancel twice", testAbortAfterTimeoutDoesNotCancelTwice),
     (
       "abort after reconnect does not cancel new session",
