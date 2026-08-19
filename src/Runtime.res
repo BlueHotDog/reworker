@@ -26,7 +26,12 @@ type limits = {
 
 type context = Request(AbortSignal.t) | Cast
 type status = Connecting | Open | Disconnected(string) | Closed(string)
-type sessionToken = ref<bool>
+type sessionToken = ref<unit>
+type lifecycle =
+  | LifecycleConnecting(option<sessionToken>)
+  | LifecycleOpen(sessionToken)
+  | LifecycleDisconnected(string)
+  | LifecycleClosed(string)
 
 type protocolMessage =
   | Request({id: Id.t, message: Obj.t})
@@ -37,6 +42,10 @@ type protocolMessage =
   | Success({id: Id.t, value: Obj.t})
   | Failure({id: Id.t, message: string})
 
+type reply = ReplyValue(Obj.t) | ReplyError(string)
+type payloadIssue = OversizedPayload | InvalidPayload
+type outgoingChunks = RequestChunks | CastChunks
+
 type pendingRequest = {
   resolve: Obj.t => unit,
   reject: JsError.t => unit,
@@ -44,21 +53,18 @@ type pendingRequest = {
   removeAbortListener: unit => unit,
 }
 
-type assemblyKind = RequestAssembly | CastAssembly
+type operationKind = RequestOperation(sessionToken) | CastOperation
 type assembly = {
-  kind: assemblyKind,
   total: int,
-  nextIndex: ref<int>,
-  bytes: ref<int>,
+  mutable bytes: int,
   body: array<string>,
-  deadlineMs: float,
+}
+type operationPhase = Assembling(assembly) | Executing(AbortController.t)
+type operation = {
+  kind: operationKind,
+  mutable phase: operationPhase,
   timeoutId: timeoutId,
 }
-type execution = {
-  controller: AbortController.t,
-  timeoutId: timeoutId,
-}
-type operation = Assembling(assembly) | Executing(execution)
 
 type registeredHandler<'sender> = (Obj.t, 'sender, context) => Response.t<Obj.t>
 
@@ -71,8 +77,7 @@ type t<'sender> = {
   settled: Map.t<Id.t, unit>,
   statusListeners: ref<array<status => unit>>,
   latestPreparedSessionToken: ref<option<sessionToken>>,
-  currentSessionToken: ref<option<sessionToken>>,
-  currentStatus: ref<status>,
+  lifecycle: ref<lifecycle>,
   assemblyBytes: ref<int>,
 }
 
@@ -119,22 +124,29 @@ let makeTransport = (~postMessage, ~subscribe, ~maxChunkBytes) => {
 
 let rejectedPromise = message => Promise.make((_resolve, reject) => reject(JsError.make(message)))
 
-let removeFirst = (listeners, listener) => {
-  let removed = ref(false)
-  listeners :=
-    listeners.contents->Array.filter(existing => {
-      if !removed.contents && existing === listener {
-        removed := true
-        false
-      } else {
-        true
-      }
-    })
+let normalizePayload = (runtime, value) => {
+  try {
+    switch value->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
+    | Some({value, _}) => Ok(value)
+    | None => Error(OversizedPayload)
+    }
+  } catch {
+  | _ => Error(InvalidPayload)
+  }
 }
 
-let notifyStatus = (runtime, committedStatus) => {
+let lifecycleStatus = lifecycle =>
+  switch lifecycle {
+  | LifecycleConnecting(_) => Connecting
+  | LifecycleOpen(_) => Open
+  | LifecycleDisconnected(reason) => Disconnected(reason)
+  | LifecycleClosed(reason) => Closed(reason)
+  }
+
+let notifyStatus = (runtime, committedLifecycle) => {
+  let committedStatus = lifecycleStatus(committedLifecycle)
   runtime.statusListeners.contents->Array.forEach(listener => {
-    if runtime.currentStatus.contents === committedStatus {
+    if runtime.lifecycle.contents === committedLifecycle {
       try {
         listener(committedStatus)
       } catch {
@@ -144,18 +156,20 @@ let notifyStatus = (runtime, committedStatus) => {
   })
 }
 
-let status = runtime => runtime.currentStatus.contents
+let status = runtime => lifecycleStatus(runtime.lifecycle.contents)
 
 let onStatus = (runtime, listener) => {
-  switch runtime.currentStatus.contents {
-  | Closed(_) => () => ()
-  | Connecting | Open | Disconnected(_) => {
-      runtime.statusListeners := runtime.statusListeners.contents->Array.concat([listener])
+  switch runtime.lifecycle.contents {
+  | LifecycleClosed(_) => () => ()
+  | LifecycleConnecting(_) | LifecycleOpen(_) | LifecycleDisconnected(_) => {
+      let subscription = status => listener(status)
+      runtime.statusListeners := runtime.statusListeners.contents->Array.concat([subscription])
       let subscribed = ref(true)
       () => {
         if subscribed.contents {
           subscribed := false
-          removeFirst(runtime.statusListeners, listener)
+          runtime.statusListeners :=
+            runtime.statusListeners.contents->Array.filter(existing => existing !== subscription)
         }
       }
     }
@@ -173,23 +187,54 @@ let markSettled = (runtime, id) => {
   }
 }
 
-let sendProtocol = (runtime, message) => {
-  switch runtime.currentStatus.contents {
-  | Closed(_) => JsError.throwWithMessage("Runtime is closed")
-  | Connecting | Disconnected(_) => JsError.throwWithMessage("Runtime is not connected")
-  | Open =>
+let sendProtocol = (runtime, sessionToken, message) => {
+  switch runtime.lifecycle.contents {
+  | LifecycleClosed(_) => JsError.throwWithMessage("Runtime is closed")
+  | LifecycleConnecting(_) | LifecycleDisconnected(_) =>
+    JsError.throwWithMessage("Runtime is not connected")
+  | LifecycleOpen(current) if current === sessionToken =>
     switch runtime.transport.postMessage(Obj.magic(message)) {
     | Ok() => ()
     | Error(message) => JsError.throwWithMessage(message)
     }
+  | LifecycleOpen(_) => JsError.throwWithMessage("Runtime is not connected")
   }
 }
 
-let sendCancel = (runtime, id) => {
+let sendCancel = (runtime, sessionToken, id) => {
   try {
-    sendProtocol(runtime, Cancel(id))
+    sendProtocol(runtime, sessionToken, Cancel(id))
   } catch {
   | _ => ()
+  }
+}
+
+let sendChunks = (runtime, sessionToken, id, chunks, kind) => {
+  let index = ref(0)
+  try {
+    while (
+      index.contents < chunks->Array.length &&
+        switch kind {
+        | RequestChunks => runtime.pending->Map.has(id)
+        | CastChunks => true
+        }
+    ) {
+      let body = chunks[index.contents]->Option.getOrThrow
+      let message: protocolMessage = switch kind {
+      | RequestChunks =>
+        RequestChunk({id, index: index.contents, total: chunks->Array.length, body})
+      | CastChunks => CastChunk({id, index: index.contents, total: chunks->Array.length, body})
+      }
+      sendProtocol(runtime, sessionToken, message)
+      index := index.contents + 1
+    }
+  } catch {
+  | error => {
+      if index.contents > 0 {
+        sendCancel(runtime, sessionToken, id)
+      }
+      JsError.throw(Obj.magic(error))
+    }
   }
 }
 
@@ -205,51 +250,42 @@ let takePending = (runtime, id) => {
   }
 }
 
-let rejectPending = (runtime, id, message, ~cancelRemote=false) => {
+let rejectPending = (runtime, id, message, ~cancelSession=?) => {
   switch takePending(runtime, id) {
   | Some(pending) => {
       pending.reject(JsError.make(message))
-      if cancelRemote {
-        sendCancel(runtime, id)
+      switch cancelSession {
+      | Some(sessionToken) => sendCancel(runtime, sessionToken, id)
+      | None => ()
       }
     }
   | None => ()
   }
 }
 
-let removeAssembly = (runtime, id, expected) => {
+let removeOperation = (runtime, id, expected, ~abort) => {
   switch runtime.operations->Map.get(id) {
-  | Some(Assembling(assembly)) if assembly === expected => {
-      clearTimeout(assembly.timeoutId)
-      runtime.operations->Map.delete(id)->ignore
-      runtime.assemblyBytes := runtime.assemblyBytes.contents - assembly.bytes.contents
-      markSettled(runtime, id)
-      true
-    }
-  | Some(Assembling(_)) | Some(Executing(_)) | None => false
-  }
-}
-
-let removeExecution = (runtime, id, expected, ~abort) => {
-  switch runtime.operations->Map.get(id) {
-  | Some(Executing(execution)) if execution === expected => {
-      clearTimeout(execution.timeoutId)
+  | Some(operation) if operation === expected => {
+      clearTimeout(operation.timeoutId)
       runtime.operations->Map.delete(id)->ignore
       markSettled(runtime, id)
-      if abort {
-        execution.controller->AbortController.abort
+      switch operation.phase {
+      | Assembling(assembly) =>
+        runtime.assemblyBytes := runtime.assemblyBytes.contents - assembly.bytes
+      | Executing(controller) if abort => controller->AbortController.abort
+      | Executing(_) => ()
       }
       true
     }
-  | Some(Assembling(_)) | Some(Executing(_)) | None => false
+  | Some(_) | None => false
   }
 }
 
 let whenOpen = runtime =>
-  switch runtime.currentStatus.contents {
-  | Open => Promise.resolve()
-  | Closed(reason) => rejectedPromise(reason)
-  | Connecting | Disconnected(_) =>
+  switch runtime.lifecycle.contents {
+  | LifecycleOpen(_) => Promise.resolve()
+  | LifecycleClosed(reason) => rejectedPromise(reason)
+  | LifecycleConnecting(_) | LifecycleDisconnected(_) =>
     Promise.make((resolve, reject) => {
       let unsubscribe = ref(() => ())
       unsubscribe :=
@@ -272,115 +308,129 @@ let whenOpen = runtime =>
 let clearCurrentWork = (runtime, reason) => {
   let pendingRequests = []
   runtime.pending->Map.forEach(pending => pendingRequests->Array.push(pending)->ignore)
+  let operations = []
+  runtime.operations->Map.forEach(operation => operations->Array.push(operation)->ignore)
   runtime.pending->Map.clear
+  runtime.operations->Map.clear
+  runtime.assemblyBytes := 0
+  runtime.settled->Map.clear
   pendingRequests->Array.forEach(pending => {
     clearTimeout(pending.timeoutId)
     pending.removeAbortListener()
     pending.reject(JsError.make(reason))
   })
-
-  let operations = []
-  runtime.operations->Map.forEachWithKey((operation, id) => {
-    operations->Array.push((id, operation))->ignore
-  })
-  operations->Array.forEach(((id, operation)) => {
-    switch operation {
-    | Assembling(assembly) => removeAssembly(runtime, id, assembly)->ignore
-    | Executing(execution) => removeExecution(runtime, id, execution, ~abort=true)->ignore
+  operations->Array.forEach(operation => {
+    clearTimeout(operation.timeoutId)
+    switch operation.phase {
+    | Executing(controller) => controller->AbortController.abort
+    | Assembling(_) => ()
     }
   })
-  runtime.assemblyBytes := 0
-  runtime.settled->Map.clear
 }
 
-let sendResponse = (runtime, sessionToken, response) => {
-  if runtime.currentSessionToken.contents === Some(sessionToken) {
-    let bounded: protocolMessage = switch response {
-    | Success({id, value}) =>
-      try {
-        switch value->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
-        | Some(prepared) => Success({id, value: prepared.value})
-        | None => Failure({id, message: "Response exceeds maxMessageBytes"})
-        }
-      } catch {
-      | _ => Failure({id, message: "Response could not be serialized"})
-      }
-    | Failure({id, message})
-      if message->MessageChunker.stringByteLength > runtime.limits.maxMessageBytes =>
-      Failure({id, message: "Remote error exceeds maxMessageBytes"})
-    | Failure(_) | Request(_) | RequestChunk(_) | Cast(_) | CastChunk(_) | Cancel(_) => response
-    }
-    try {
-      sendProtocol(runtime, bounded)
-    } catch {
-    | _ =>
-      switch bounded {
-      | Success({id, value: _}) =>
+let sendReply = (runtime, sessionToken, id, reply) => {
+  switch runtime.lifecycle.contents {
+  | LifecycleOpen(current) if current === sessionToken => {
+      let (bounded, retryClone): (protocolMessage, bool) = switch reply {
+      | ReplyValue(value) =>
         try {
-          sendProtocol(
-            runtime,
-            (Failure({id, message: "Response could not be cloned"}): protocolMessage),
-          )
+          switch value->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
+          | Some(prepared) => (Success({id, value: prepared.value}), true)
+          | None => (Failure({id, message: "Response exceeds maxMessageBytes"}), false)
+          }
         } catch {
-        | _ => ()
+        | _ => (Failure({id, message: "Response could not be serialized"}), false)
         }
-      | Failure(_) | Request(_) | RequestChunk(_) | Cast(_) | CastChunk(_) | Cancel(_) => ()
+      | ReplyError(message) => (
+          Failure({
+            id,
+            message: message->MessageChunker.stringByteLength > runtime.limits.maxMessageBytes
+              ? "Remote error exceeds maxMessageBytes"
+              : message,
+          }),
+          false,
+        )
+      }
+      try {
+        sendProtocol(runtime, sessionToken, bounded)
+      } catch {
+      | _ =>
+        if retryClone {
+          try {
+            sendProtocol(
+              runtime,
+              sessionToken,
+              (Failure({id, message: "Response could not be cloned"}): protocolMessage),
+            )
+          } catch {
+          | _ => ()
+          }
+        }
       }
     }
+  | LifecycleConnecting(_) | LifecycleOpen(_) | LifecycleDisconnected(_) | LifecycleClosed(_) => ()
   }
 }
 
-let runRequestHandler = (runtime, sessionToken, id, message, sender, ~deadlineMs=?) => {
+let executeRequest = (runtime, sessionToken, id, message, sender, operation, controller) => {
+  let complete = makeResponse => {
+    if removeOperation(runtime, id, operation, ~abort=false) {
+      sendReply(runtime, sessionToken, id, makeResponse())
+    }
+  }
+  try {
+    switch runtime.handler(message, sender, Request(controller->AbortController.signal)) {
+    | Response.RespondNow(value) => complete(() => ReplyValue(value))
+    | Response.RespondLater(promise) =>
+      promise
+      ->Promise.thenResolve(value => {
+        complete(() => ReplyValue(value))
+      })
+      ->Promise.catch(error => {
+        complete(() => ReplyError(exceptionMessage(error)))
+        Promise.resolve()
+      })
+      ->ignore
+    | Response.NoResponse => complete(() => ReplyError("Handler did not respond"))
+    }
+  } catch {
+  | error => complete(() => ReplyError(exceptionMessage(error)))
+  }
+}
+
+let startOperation = (runtime, id, kind, phase) => {
+  let operationRef: ref<option<operation>> = ref(None)
+  let timeoutId = setTimeout(() => {
+    operationRef.contents->Option.forEach(operation => {
+      if removeOperation(runtime, id, operation, ~abort=true) {
+        switch operation.kind {
+        | RequestOperation(sessionToken) =>
+          sendReply(runtime, sessionToken, id, ReplyError("Request timed out"))
+        | CastOperation => ()
+        }
+      }
+    })
+  }, runtime.limits.requestTimeoutMs)
+  let operation = {kind, phase, timeoutId}
+  operationRef := Some(operation)
+  runtime.operations->Map.set(id, operation)
+  operation
+}
+
+let reserveDirectRequest = (runtime, sessionToken, id) => {
   if runtime.operations->Map.size >= runtime.limits.maxPendingRequests {
     markSettled(runtime, id)
-    sendResponse(runtime, sessionToken, Failure({id, message: "Too many pending requests"}))
+    sendReply(runtime, sessionToken, id, ReplyError("Too many pending requests"))
+    None
   } else {
     let controller = AbortController.make()
-    let executionRef: ref<option<execution>> = ref(None)
-    let onTimeout = () => {
-      executionRef.contents->Option.forEach(execution => {
-        if removeExecution(runtime, id, execution, ~abort=true) {
-          sendResponse(runtime, sessionToken, Failure({id, message: "Request timed out"}))
-        }
-      })
-    }
-    let timeoutId = switch deadlineMs {
-    | Some(deadlineMs) => {
-        let remainingMs = deadlineMs - Date.now()
-        setTimeoutFloat(onTimeout, remainingMs > 0.0 ? remainingMs : 0.0)
-      }
-    | None => setTimeout(onTimeout, runtime.limits.requestTimeoutMs)
-    }
-    let execution = {controller, timeoutId}
-    executionRef := Some(execution)
-    runtime.operations->Map.set(id, Executing(execution))
-    let complete = makeResponse => {
-      if removeExecution(runtime, id, execution, ~abort=false) {
-        sendResponse(runtime, sessionToken, makeResponse())
-      }
-    }
-    try {
-      switch runtime.handler(
-        message,
-        sender,
-        Request(execution.controller->AbortController.signal),
-      ) {
-      | Response.RespondNow(value) => complete(() => Success({id, value}))
-      | Response.RespondLater(promise) =>
-        promise
-        ->Promise.thenResolve(value => {
-          complete(() => Success({id, value}))
-        })
-        ->Promise.catch(error => {
-          complete(() => Failure({id, message: exceptionMessage(error)}))
-          Promise.resolve()
-        })
-        ->ignore
-      | Response.NoResponse => complete(() => Failure({id, message: "Handler did not respond"}))
-      }
-    } catch {
-    | error => complete(() => Failure({id, message: exceptionMessage(error)}))
-    }
+    let operation = startOperation(
+      runtime,
+      id,
+      RequestOperation(sessionToken),
+      Executing(controller),
+    )
+    Some((operation, controller))
   }
 }
 
@@ -396,22 +446,41 @@ let runCastHandler = (runtime, message, sender) => {
   }
 }
 
-let failAssembly = (runtime, sessionToken, id, kind, message, ~respond) => {
-  switch runtime.operations->Map.get(id) {
-  | Some(Assembling(assembly)) if assembly.kind === kind =>
-    removeAssembly(runtime, id, assembly)->ignore
-  | None => markSettled(runtime, id)
-  | Some(Assembling(_)) | Some(Executing(_)) => ()
+let sameOperationKind = (left, right) =>
+  switch (left, right) {
+  | (RequestOperation(_), RequestOperation(_)) | (CastOperation, CastOperation) => true
+  | (RequestOperation(_), CastOperation) | (CastOperation, RequestOperation(_)) => false
   }
-  if respond {
-    sendResponse(runtime, sessionToken, Failure({id, message}))
+
+let sendOperationFailure = (runtime, id, kind, message) => {
+  switch kind {
+  | RequestOperation(sessionToken) => sendReply(runtime, sessionToken, id, ReplyError(message))
+  | CastOperation => ()
   }
 }
 
-let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) => {
-  let respond = kind === RequestAssembly
-  let malformed = () =>
-    failAssembly(runtime, sessionToken, id, kind, "Malformed chunk sequence", ~respond)
+let failAssembly = (runtime, id, kind, message) => {
+  let failed = switch runtime.operations->Map.get(id) {
+  | Some(operation)
+    if operation.kind->sameOperationKind(kind) &&
+      switch operation.phase {
+      | Assembling(_) => true
+      | Executing(_) => false
+      } =>
+    removeOperation(runtime, id, operation, ~abort=false)
+  | None => {
+      markSettled(runtime, id)
+      true
+    }
+  | Some(_) => false
+  }
+  if failed {
+    sendOperationFailure(runtime, id, kind, message)
+  }
+}
+
+let handleChunk = (runtime, id, index, total, body, sender, kind) => {
+  let malformed = () => failAssembly(runtime, id, kind, "Malformed chunk sequence")
   if runtime.settled->Map.has(id) {
     ()
   } else if (
@@ -425,97 +494,57 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
   } else {
     let bodyBytes = body->MessageChunker.stringByteLength
     if bodyBytes > runtime.transport.maxChunkBytes {
-      failAssembly(runtime, sessionToken, id, kind, "Chunk exceeds maxChunkBytes", ~respond)
+      failAssembly(runtime, id, kind, "Chunk exceeds maxChunkBytes")
     } else {
-      let assembly = switch runtime.operations->Map.get(id) {
+      let operation = switch runtime.operations->Map.get(id) {
       | None if index !== 0 => {
           malformed()
           None
         }
       | None if runtime.operations->Map.size < runtime.limits.maxPendingRequests => {
-          let assemblyRef: ref<option<assembly>> = ref(None)
-          let deadlineMs = Date.now() + runtime.limits.requestTimeoutMs->Int.toFloat
-          let timeoutId = setTimeoutFloat(() => {
-            assemblyRef.contents->Option.forEach(assembly => {
-              if removeAssembly(runtime, id, assembly) && kind === RequestAssembly {
-                sendResponse(runtime, sessionToken, Failure({id, message: "Request timed out"}))
-              }
-            })
-          }, deadlineMs - Date.now())
-          let assembly = {
-            kind,
-            total,
-            nextIndex: ref(0),
-            bytes: ref(0),
-            body: [],
-            deadlineMs,
-            timeoutId,
-          }
-          assemblyRef := Some(assembly)
-          runtime.operations->Map.set(id, Assembling(assembly))
-          Some(assembly)
+          let assembly = {total, bytes: 0, body: []}
+          Some(startOperation(runtime, id, kind, Assembling(assembly)))
         }
-      | Some(Assembling(assembly)) => Some(assembly)
+      | Some(operation) => Some(operation)
       | None => {
           markSettled(runtime, id)
-          if respond {
-            sendResponse(runtime, sessionToken, Failure({id, message: "Too many pending requests"}))
-          }
-          None
-        }
-      | Some(Executing(_)) => {
-          if respond {
-            sendResponse(runtime, sessionToken, Failure({id, message: "Duplicate request"}))
-          }
+          sendOperationFailure(runtime, id, kind, "Too many pending requests")
           None
         }
       }
-      switch assembly {
-      | Some(assembly)
-        if assembly.kind !== kind ||
-        assembly.total !== total ||
-        assembly.nextIndex.contents !== index ||
-        assembly.bytes.contents + bodyBytes > runtime.limits.maxMessageBytes =>
+      switch operation {
+      | Some(operation) if !(operation.kind->sameOperationKind(kind)) => malformed()
+      | Some({phase: Assembling(assembly), _})
+        if assembly.total !== total ||
+        assembly.body->Array.length !== index ||
+        assembly.bytes + bodyBytes > runtime.limits.maxMessageBytes =>
         malformed()
-      | Some(_) if runtime.assemblyBytes.contents + bodyBytes > runtime.limits.maxMessageBytes =>
-        failAssembly(
-          runtime,
-          sessionToken,
-          id,
-          kind,
-          "Chunk allocation exceeds maxMessageBytes",
-          ~respond,
-        )
-      | Some(assembly) => {
+      | Some({phase: Assembling(_), _})
+        if runtime.assemblyBytes.contents + bodyBytes > runtime.limits.maxMessageBytes =>
+        failAssembly(runtime, id, kind, "Chunk allocation exceeds maxMessageBytes")
+      | Some({phase: Executing(_), _}) => ()
+      | Some({phase: Assembling(assembly), _} as operation) => {
           assembly.body->Array.push(body)->ignore
-          assembly.bytes := assembly.bytes.contents + bodyBytes
+          assembly.bytes = assembly.bytes + bodyBytes
           runtime.assemblyBytes := runtime.assemblyBytes.contents + bodyBytes
-          assembly.nextIndex := assembly.nextIndex.contents + 1
-          if assembly.nextIndex.contents === total {
-            removeAssembly(runtime, id, assembly)->ignore
+          if assembly.body->Array.length === total {
             try {
               let message = assembly.body->Array.join("")->JSON.parseOrThrow->Obj.magic
               switch kind {
-              | RequestAssembly =>
-                runRequestHandler(
-                  runtime,
-                  sessionToken,
-                  id,
-                  message,
-                  sender,
-                  ~deadlineMs=assembly.deadlineMs,
-                )
-              | CastAssembly => runCastHandler(runtime, message, sender)
+              | RequestOperation(sessionToken) => {
+                  runtime.assemblyBytes := runtime.assemblyBytes.contents - assembly.bytes
+                  let controller = AbortController.make()
+                  operation.phase = Executing(controller)
+                  markSettled(runtime, id)
+                  executeRequest(runtime, sessionToken, id, message, sender, operation, controller)
+                }
+              | CastOperation =>
+                if removeOperation(runtime, id, operation, ~abort=false) {
+                  runCastHandler(runtime, message, sender)
+                }
               }
             } catch {
-            | _ =>
-              if respond {
-                sendResponse(
-                  runtime,
-                  sessionToken,
-                  Failure({id, message: "Malformed chunk sequence"}),
-                )
-              }
+            | _ => malformed()
             }
           }
         }
@@ -525,141 +554,117 @@ let handleChunk = (runtime, sessionToken, id, index, total, body, sender, kind) 
   }
 }
 
-let isValidId = id =>
-  Type.typeof(Obj.magic(id)) === #string &&
-  id->Id.toString !== "" &&
-  id->Id.toString->String.length <= 64
-
-let handleChunkMessage = (
-  runtime,
-  sessionToken,
-  rawMessage,
-  id,
-  index,
-  total,
-  body,
-  sender,
-  kind,
-) => {
-  if (
-    hasOwn(rawMessage, "id") &&
-    isValidId(id) &&
-    hasOwn(rawMessage, "index") &&
-    isSafeInteger(Obj.magic(index)) &&
-    hasOwn(rawMessage, "total") &&
-    isSafeInteger(Obj.magic(total)) &&
-    hasOwn(rawMessage, "body") &&
-    Type.typeof(Obj.magic(body)) === #string
-  ) {
-    handleChunk(runtime, sessionToken, id, index, total, body, sender, kind)
+let isValidId = id => {
+  if Type.typeof(Obj.magic(id)) !== #string {
+    false
+  } else {
+    let value = id->Id.toString
+    value !== "" && value->String.length <= 64
   }
 }
+
+let hasValidId = (rawMessage, id) => hasOwn(rawMessage, "id") && isValidId(id)
+
+let sessionIsOpen = (runtime, sessionToken) =>
+  switch runtime.lifecycle.contents {
+  | LifecycleOpen(current) => current === sessionToken
+  | LifecycleConnecting(_) | LifecycleDisconnected(_) | LifecycleClosed(_) => false
+  }
+
+let operationIsActive = (runtime, id, expected) =>
+  switch runtime.operations->Map.get(id) {
+  | Some(operation) => operation === expected
+  | None => false
+  }
+
+let handleDirectRequest = (runtime, sessionToken, id, message, sender) => {
+  if !(runtime.operations->Map.has(id)) && !(runtime.settled->Map.has(id)) {
+    switch reserveDirectRequest(runtime, sessionToken, id) {
+    | Some((operation, controller)) =>
+      switch normalizePayload(runtime, message) {
+      | Ok(message)
+        if operationIsActive(runtime, id, operation) && sessionIsOpen(runtime, sessionToken) =>
+        executeRequest(runtime, sessionToken, id, message, sender, operation, controller)
+      | Ok(_) => ()
+      | Error(issue) =>
+        if removeOperation(runtime, id, operation, ~abort=false) {
+          let message = switch issue {
+          | OversizedPayload => "Message exceeds maxMessageBytes"
+          | InvalidPayload => "Invalid request payload"
+          }
+          sendReply(runtime, sessionToken, id, ReplyError(message))
+        }
+      }
+    | None => ()
+    }
+  }
+}
+
+let handleDirectCast = (runtime, sessionToken, message, sender) => {
+  switch normalizePayload(runtime, message) {
+  | Ok(message) if sessionIsOpen(runtime, sessionToken) => runCastHandler(runtime, message, sender)
+  | Ok(_) | Error(OversizedPayload | InvalidPayload) => ()
+  }
+}
+
+let isValidChunkMessage = (rawMessage, id, index, total, body) =>
+  hasValidId(rawMessage, id) &&
+  hasOwn(rawMessage, "index") &&
+  isSafeInteger(Obj.magic(index)) &&
+  hasOwn(rawMessage, "total") &&
+  isSafeInteger(Obj.magic(total)) &&
+  hasOwn(rawMessage, "body") &&
+  Type.typeof(Obj.magic(body)) === #string
 
 let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
   try {
     switch (Obj.magic(rawMessage): protocolMessage) {
-    | Success({id, value}) =>
-      if hasOwn(rawMessage, "id") && isValidId(id) {
-        if !hasOwn(rawMessage, "value") {
-          rejectPending(runtime, id, "Invalid response payload")
-        } else {
-          try {
-            switch value->MessageChunker.prepareJsonWithin(
-              ~maxBytes=runtime.limits.maxMessageBytes,
-            ) {
-            | Some(prepared) =>
-              switch takePending(runtime, id) {
-              | Some(pending) => pending.resolve(prepared.value)
-              | None => ()
-              }
-            | None => rejectPending(runtime, id, "Invalid response payload")
-            }
-          } catch {
-          | _ => rejectPending(runtime, id, "Invalid response payload")
-          }
-        }
-      }
-    | Failure({id, message}) =>
-      if hasOwn(rawMessage, "id") && isValidId(id) {
-        if (
-          !hasOwn(rawMessage, "message") ||
-          Type.typeof(Obj.magic(message)) !== #string ||
-          message->MessageChunker.stringByteLength > runtime.limits.maxMessageBytes
-        ) {
-          rejectPending(runtime, id, "Invalid response payload")
-        } else {
-          rejectPending(runtime, id, message)
-        }
-      }
-    | Request({id, message}) =>
-      if hasOwn(rawMessage, "id") && isValidId(id) && hasOwn(rawMessage, "message") {
-        switch (runtime.operations->Map.get(id), runtime.settled->Map.has(id)) {
-        | (Some(_), _) => ()
-        | (None, true) => ()
-        | (None, false) =>
-          try {
-            switch message->MessageChunker.prepareJsonWithin(
-              ~maxBytes=runtime.limits.maxMessageBytes,
-            ) {
-            | None =>
-              sendResponse(
-                runtime,
-                sessionToken,
-                Failure({id, message: "Message exceeds maxMessageBytes"}),
-              )
-            | Some(prepared) => runRequestHandler(runtime, sessionToken, id, prepared.value, sender)
-            }
-          } catch {
-          | _ =>
-            sendResponse(runtime, sessionToken, Failure({id, message: "Invalid request payload"}))
-          }
-        }
-      }
-    | RequestChunk({id, index, total, body}) =>
-      handleChunkMessage(
-        runtime,
-        sessionToken,
-        rawMessage,
-        id,
-        index,
-        total,
-        body,
-        sender,
-        RequestAssembly,
-      )
-    | Cast(message) =>
-      if hasOwn(rawMessage, "_0") {
-        try {
-          switch message->MessageChunker.prepareJsonWithin(
-            ~maxBytes=runtime.limits.maxMessageBytes,
-          ) {
-          | Some(prepared) => runCastHandler(runtime, prepared.value, sender)
-          | None => ()
-          }
-        } catch {
-        | _ => ()
-        }
-      }
-    | CastChunk({id, index, total, body}) =>
-      handleChunkMessage(
-        runtime,
-        sessionToken,
-        rawMessage,
-        id,
-        index,
-        total,
-        body,
-        sender,
-        CastAssembly,
-      )
-    | Cancel(id) =>
-      if hasOwn(rawMessage, "_0") && isValidId(id) {
-        switch runtime.operations->Map.get(id) {
-        | Some(Executing(execution)) => removeExecution(runtime, id, execution, ~abort=true)->ignore
-        | Some(Assembling(assembly)) => removeAssembly(runtime, id, assembly)->ignore
+    | Success({id, value}) if hasValidId(rawMessage, id) && hasOwn(rawMessage, "value") =>
+      switch normalizePayload(runtime, value) {
+      | Ok(value) =>
+        switch takePending(runtime, id) {
+        | Some(pending) => pending.resolve(value)
         | None => ()
         }
+      | Error(OversizedPayload | InvalidPayload) =>
+        rejectPending(runtime, id, "Invalid response payload")
       }
+    | Success({id, _}) if hasValidId(rawMessage, id) =>
+      rejectPending(runtime, id, "Invalid response payload")
+    | Failure({id, message})
+      if hasValidId(rawMessage, id) &&
+      hasOwn(rawMessage, "message") &&
+      Type.typeof(Obj.magic(message)) === #string &&
+      message->MessageChunker.stringByteLength <= runtime.limits.maxMessageBytes =>
+      rejectPending(runtime, id, message)
+    | Failure({id, _}) if hasValidId(rawMessage, id) =>
+      rejectPending(runtime, id, "Invalid response payload")
+    | Request({id, message}) if hasValidId(rawMessage, id) && hasOwn(rawMessage, "message") =>
+      handleDirectRequest(runtime, sessionToken, id, message, sender)
+    | RequestChunk({id, index, total, body})
+      if isValidChunkMessage(rawMessage, id, index, total, body) =>
+      handleChunk(runtime, id, index, total, body, sender, RequestOperation(sessionToken))
+    | RequestChunk({id, _}) if hasValidId(rawMessage, id) =>
+      failAssembly(runtime, id, RequestOperation(sessionToken), "Malformed chunk sequence")
+    | Cast(message) if hasOwn(rawMessage, "_0") =>
+      handleDirectCast(runtime, sessionToken, message, sender)
+    | CastChunk({id, index, total, body})
+      if isValidChunkMessage(rawMessage, id, index, total, body) =>
+      handleChunk(runtime, id, index, total, body, sender, CastOperation)
+    | CastChunk({id, _}) if hasValidId(rawMessage, id) =>
+      failAssembly(runtime, id, CastOperation, "Malformed chunk sequence")
+    | Cancel(id) if hasOwn(rawMessage, "_0") && isValidId(id) =>
+      switch runtime.operations->Map.get(id) {
+      | Some(operation) => removeOperation(runtime, id, operation, ~abort=true)->ignore
+      | None => ()
+      }
+    | Success(_)
+    | Failure(_)
+    | Request(_)
+    | RequestChunk(_)
+    | Cast(_)
+    | CastChunk(_)
+    | Cancel(_) => ()
     }
   } catch {
   | _ => ()
@@ -667,50 +672,62 @@ let handleMessage = (runtime, sessionToken, rawMessage, sender) => {
 }
 
 let prepareRuntimeSession = (runtime): session<'sender> => {
-  let sessionToken = ref(false)
+  let sessionToken = ref()
   runtime.latestPreparedSessionToken := Some(sessionToken)
   let session = {
     connecting: () => {
-      if (
-        !sessionToken.contents && runtime.latestPreparedSessionToken.contents === Some(sessionToken)
-      ) {
-        sessionToken := true
-        switch runtime.currentStatus.contents {
-        | Closed(_) => ()
-        | Connecting | Open | Disconnected(_) => {
-            let previous = runtime.currentSessionToken.contents
-            runtime.currentSessionToken := Some(sessionToken)
-            runtime.currentStatus := Connecting
-            previous->Option.forEach(_ => clearCurrentWork(runtime, "Connection replaced"))
-            notifyStatus(runtime, Connecting)
+      if runtime.latestPreparedSessionToken.contents === Some(sessionToken) {
+        runtime.latestPreparedSessionToken := None
+        let connect = replaced => {
+          let connecting = LifecycleConnecting(Some(sessionToken))
+          runtime.lifecycle := connecting
+          if replaced {
+            clearCurrentWork(runtime, "Connection replaced")
           }
+          notifyStatus(runtime, connecting)
+        }
+        switch runtime.lifecycle.contents {
+        | LifecycleClosed(_) => ()
+        | LifecycleConnecting(Some(_)) | LifecycleOpen(_) => connect(true)
+        | LifecycleConnecting(None) | LifecycleDisconnected(_) => connect(false)
         }
       }
     },
     opened: () => {
-      if (
-        runtime.currentSessionToken.contents === Some(sessionToken) &&
-          runtime.currentStatus.contents !== Open
-      ) {
-        runtime.currentStatus := Open
-        notifyStatus(runtime, Open)
+      switch runtime.lifecycle.contents {
+      | LifecycleConnecting(Some(current)) if current === sessionToken => {
+          let opened = LifecycleOpen(sessionToken)
+          runtime.lifecycle := opened
+          notifyStatus(runtime, opened)
+        }
+      | LifecycleConnecting(_)
+      | LifecycleOpen(_)
+      | LifecycleDisconnected(_)
+      | LifecycleClosed(_) => ()
       }
     },
     message: (payload, sender) => {
-      if (
-        runtime.currentStatus.contents === Open &&
-          runtime.currentSessionToken.contents === Some(sessionToken)
-      ) {
+      switch runtime.lifecycle.contents {
+      | LifecycleOpen(current) if current === sessionToken =>
         handleMessage(runtime, sessionToken, payload, sender)
+      | LifecycleConnecting(_)
+      | LifecycleOpen(_)
+      | LifecycleDisconnected(_)
+      | LifecycleClosed(_) => ()
       }
     },
     disconnected: reason => {
-      if runtime.currentSessionToken.contents === Some(sessionToken) {
-        runtime.currentSessionToken := None
-        let disconnected: status = Disconnected(reason)
-        runtime.currentStatus := disconnected
-        clearCurrentWork(runtime, reason)
-        notifyStatus(runtime, disconnected)
+      switch runtime.lifecycle.contents {
+      | LifecycleConnecting(Some(current)) | LifecycleOpen(current) if current === sessionToken => {
+          let disconnected = LifecycleDisconnected(reason)
+          runtime.lifecycle := disconnected
+          clearCurrentWork(runtime, reason)
+          notifyStatus(runtime, disconnected)
+        }
+      | LifecycleConnecting(_)
+      | LifecycleOpen(_)
+      | LifecycleDisconnected(_)
+      | LifecycleClosed(_) => ()
       }
     },
   }
@@ -749,8 +766,7 @@ let make:
       settled: Map.make(),
       statusListeners: ref([]),
       latestPreparedSessionToken: ref(None),
-      currentSessionToken: ref(None),
-      currentStatus: ref(Connecting),
+      lifecycle: ref(LifecycleConnecting(None)),
       assemblyBytes: ref(0),
     }
     try {
@@ -768,24 +784,30 @@ let make:
     runtime
   }
 
-let sendPreparedRequest = (runtime, prepared: MessageChunker.preparedJson, ~signal=?) => {
-  switch runtime.currentSessionToken.contents {
-  | None => rejectedPromise("Runtime is not connected")
-  | Some(_) if runtime.pending->Map.size >= runtime.limits.maxPendingRequests =>
+let sendPreparedRequest = (
+  runtime,
+  sessionToken,
+  prepared: MessageChunker.preparedJson,
+  ~signal=?,
+) => {
+  switch runtime.lifecycle.contents {
+  | LifecycleOpen(current)
+    if current === sessionToken && runtime.pending->Map.size >= runtime.limits.maxPendingRequests =>
     rejectedPromise("Too many pending requests")
-  | Some(_) => {
+  | LifecycleOpen(current) if current === sessionToken => {
       let id = Id.make()
       Promise.make((resolve, reject) => {
         if signal->Option.mapOr(false, AbortSignal.aborted) {
           reject(JsError.make("Request aborted"))
         } else {
-          let abortHandler = () => rejectPending(runtime, id, "Request aborted", ~cancelRemote=true)
+          let abortHandler = () =>
+            rejectPending(runtime, id, "Request aborted", ~cancelSession=sessionToken)
           let removeAbortListener = switch signal {
           | Some(signal) => AbortSignal.onAbort(signal, abortHandler)
           | None => () => ()
           }
           let timeoutId = setTimeout(
-            () => rejectPending(runtime, id, "Request timed out", ~cancelRemote=true),
+            () => rejectPending(runtime, id, "Request timed out", ~cancelSession=sessionToken),
             runtime.limits.requestTimeoutMs,
           )
           runtime.pending->Map.set(
@@ -797,39 +819,27 @@ let sendPreparedRequest = (runtime, prepared: MessageChunker.preparedJson, ~sign
               removeAbortListener,
             },
           )
-          let sentChunks = ref(0)
           try {
             switch prepared->MessageChunker.chunkPrepared(~size=runtime.transport.maxChunkBytes) {
-            | Some(chunks) =>
-              let index = ref(0)
-              while index.contents < chunks->Array.length && runtime.pending->Map.has(id) {
-                sendProtocol(
-                  runtime,
-                  RequestChunk({
-                    id,
-                    index: index.contents,
-                    total: chunks->Array.length,
-                    body: chunks[index.contents]->Option.getOrThrow,
-                  }),
-                )
-                sentChunks := sentChunks.contents + 1
-                index := index.contents + 1
-              }
+            | Some(chunks) => sendChunks(runtime, sessionToken, id, chunks, RequestChunks)
             | None =>
-              sendProtocol(runtime, (Request({id, message: prepared.value}): protocolMessage))
+              sendProtocol(
+                runtime,
+                sessionToken,
+                (Request({id, message: prepared.value}): protocolMessage),
+              )
             }
           } catch {
           | error =>
             if runtime.pending->Map.has(id) {
-              if sentChunks.contents > 0 {
-                sendCancel(runtime, id)
-              }
               rejectPending(runtime, id, exceptionMessage(error))
             }
           }
         }
       })
     }
+  | LifecycleConnecting(_) | LifecycleOpen(_) | LifecycleDisconnected(_) | LifecycleClosed(_) =>
+    rejectedPromise("Runtime is not connected")
   }
 }
 
@@ -840,19 +850,31 @@ let sendMessage:
     ~signal: AbortSignal.t=?,
   ) => Promise.t<response> =
   (runtime, message, ~signal=?) => {
-    try {
-      switch message->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
-      | Some(prepared) => sendPreparedRequest(runtime, prepared, ~signal?)->Obj.magic
-      | None => rejectedPromise("Message exceeds maxMessageBytes")
+    switch runtime.lifecycle.contents {
+    | LifecycleOpen(sessionToken) =>
+      try {
+        switch message->MessageChunker.prepareJsonWithin(~maxBytes=runtime.limits.maxMessageBytes) {
+        | Some(prepared) =>
+          sendPreparedRequest(runtime, sessionToken, prepared, ~signal?)->Obj.magic
+        | None => rejectedPromise("Message exceeds maxMessageBytes")
+        }
+      } catch {
+      | error => Promise.reject(error)
       }
-    } catch {
-    | error => Promise.reject(error)
+    | LifecycleConnecting(_) | LifecycleDisconnected(_) | LifecycleClosed(_) =>
+      rejectedPromise("Runtime is not connected")
     }
   }
 
 let cast:
   type sender. (t<sender>, Types.message<unit>) => unit =
   (runtime, message) => {
+    let sessionToken = switch runtime.lifecycle.contents {
+    | LifecycleOpen(sessionToken) => sessionToken
+    | LifecycleClosed(_) => JsError.throwWithMessage("Runtime is closed")
+    | LifecycleConnecting(_) | LifecycleDisconnected(_) =>
+      JsError.throwWithMessage("Runtime is not connected")
+    }
     let prepared = switch message->MessageChunker.prepareJsonWithin(
       ~maxBytes=runtime.limits.maxMessageBytes,
     ) {
@@ -862,41 +884,23 @@ let cast:
     switch prepared->MessageChunker.chunkPrepared(~size=runtime.transport.maxChunkBytes) {
     | Some(chunks) =>
       let id = Id.make()
-      let sent = ref(0)
       try {
-        chunks->Array.forEachWithIndex((body, index) => {
-          sendProtocol(
-            runtime,
-            CastChunk({
-              id,
-              index,
-              total: chunks->Array.length,
-              body,
-            }),
-          )
-          sent := sent.contents + 1
-        })
+        sendChunks(runtime, sessionToken, id, chunks, CastChunks)
       } catch {
-      | error => {
-          if sent.contents > 0 {
-            sendCancel(runtime, id)
-          }
-          JsError.throwWithMessage(exceptionMessage(error))
-        }
+      | error => JsError.throwWithMessage(exceptionMessage(error))
       }
-    | None => sendProtocol(runtime, (Cast(prepared.value): protocolMessage))
+    | None => sendProtocol(runtime, sessionToken, (Cast(prepared.value): protocolMessage))
     }
   }
 
 let close = runtime => {
-  switch runtime.currentStatus.contents {
-  | Closed(_) => ()
-  | Connecting | Open | Disconnected(_) => {
+  switch runtime.lifecycle.contents {
+  | LifecycleClosed(_) => ()
+  | LifecycleConnecting(_) | LifecycleOpen(_) | LifecycleDisconnected(_) => {
       let reason = "Runtime closed"
-      let closed = Closed(reason)
-      runtime.currentStatus := closed
+      let closed = LifecycleClosed(reason)
+      runtime.lifecycle := closed
       runtime.latestPreparedSessionToken := None
-      runtime.currentSessionToken := None
       clearCurrentWork(runtime, reason)
       try {
         runtime.transport.close()
